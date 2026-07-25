@@ -1,0 +1,24 @@
+[Unit]
+Description=Innova Node Dashboard
+After=network-online.target innovad.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=innova-dashboard
+Group=innova-dashboard
+EnvironmentFile=-/etc/innova-node-dashboard/config.env
+WorkingDirectory=/opt/innova-node-dashboard
+ExecStart=/usr/bin/python3 /opt/innova-node-dashboard/backend/server.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+[Install]
+WantedBy=multi-user.target
