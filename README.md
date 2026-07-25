@@ -57,3 +57,12 @@ The dashboard is read-only and does not expose arbitrary RPC execution or creden
 ## Future innovad integration
 
 Serve the same static frontend and implement `GET /api/v1/status` in the daemon according to `docs/API.md`. The frontend contains no Python-specific code.
+
+
+## Version 0.2.0
+
+- node uptime now comes from the running `innovad` process via `ps etimes`;
+- node start time comes from `ps lstart`;
+- the installer detects the owner and group of `INNOVA_DATADIR`;
+- the systemd service runs as that owner, avoiding private datadir permission errors;
+- the public dashboard UI is now in English.
