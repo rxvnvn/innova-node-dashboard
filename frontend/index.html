@@ -16,7 +16,7 @@
     <main>
       <section class="hero">
         <div><p class="label">Current height</p><div id="height" class="height">—</div></div>
-        <div class="heroMeta"><span id="ibd">Sync status unknown</span><span id="updated">Updating…</span></div>
+        <div class="heroMeta"><span id="ibd">Sync status unknown</span><span id="heightSource" class="source">Source unknown</span><span id="updated">Updating…</span></div>
       </section>
       <section class="grid">
         <article><p class="label">Node started</p><div id="started" class="value small">—</div></article>
@@ -32,6 +32,8 @@
         <div><span>Node PID</span><b id="pid">—</b></div>
         <div><span>API</span><b id="api">—</b></div>
       </section>
+      <section class="freshness"><span id="rpcFreshness">Node info: never · Peers: never</span></section>
+      <section id="notices" class="notices" hidden><b>Node data partially cached</b><pre id="noticeText"></pre></section>
       <section id="errors" class="errors" hidden><b>Diagnostics</b><pre id="errorText"></pre></section>
     </main>
     <footer>Innova Node Dashboard <span id="dashVersion">—</span></footer>

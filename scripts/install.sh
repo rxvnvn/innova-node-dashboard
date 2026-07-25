@@ -52,6 +52,10 @@ INNOVA_DASHBOARD_HOST=0.0.0.0
 INNOVA_DASHBOARD_PORT=8787
 INNOVA_DASHBOARD_REFRESH=5
 INNOVA_DASHBOARD_RPC_TIMEOUT=8
+INNOVA_DASHBOARD_INFO_INTERVAL=60
+INNOVA_DASHBOARD_PEER_INTERVAL=120
+INNOVA_DASHBOARD_MAX_BACKOFF=900
+INNOVA_DASHBOARD_LOG_TAIL_BYTES=262144
 INNOVA_DASHBOARD_FRONTEND=${DEST}/frontend
 EOF
 else
@@ -76,7 +80,7 @@ systemctl restart innova-node-dashboard.service
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo
-echo "Innova Node Dashboard 0.2.0 installed."
+echo "Innova Node Dashboard 0.2.1 installed."
 echo "Service user: ${DASHBOARD_USER}:${DASHBOARD_GROUP}"
 echo "Node datadir: ${DATADIR}"
 echo "Dashboard: http://${IP:-127.0.0.1}:8787"
