@@ -80,7 +80,7 @@ systemctl restart innova-node-dashboard.service
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo
-echo "Innova Node Dashboard 0.2.1 installed."
+echo "Innova Node Dashboard 0.3.0 installed."
 echo "Service user: ${DASHBOARD_USER}:${DASHBOARD_GROUP}"
 echo "Node datadir: ${DATADIR}"
 echo "Dashboard: http://${IP:-127.0.0.1}:8787"
