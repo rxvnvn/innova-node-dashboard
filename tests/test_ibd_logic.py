@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import collections
+import datetime as dt
+import json
 import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 from server import (
     IBDSampler,
     IBDTracker,
+    TimedValue,
     aggregate_peers,
     as_float,
     as_int,
+    build_snapshot,
     compute_eta,
     estimate_network_height,
 )
@@ -376,6 +381,221 @@ class TestComputeETAEdgeCases(unittest.TestCase):
         eta = compute_eta(10.0, 900000, 1000000)
         self.assertIsNotNone(eta)
         self.assertGreater(eta, 0)
+
+
+class TestIBDTrackerLastAdvanceTime(unittest.TestCase):
+    def test_fresh_tracker_returns_none(self):
+        t = IBDTracker()
+        self.assertIsNone(t.last_advance_time())
+
+    def test_first_height_sample_returns_none(self):
+        t = IBDTracker()
+        t.update(100, now=1000.0)
+        self.assertIsNone(t.last_advance_time())
+
+    def test_same_height_returns_none(self):
+        t = IBDTracker()
+        t.update(100, now=1000.0)
+        t.update(100, now=1010.0)
+        self.assertIsNone(t.last_advance_time())
+
+    def test_height_increase_records_advance(self):
+        t = IBDTracker()
+        t.update(100, now=1000.0)
+        t.update(200, now=1010.0)
+        self.assertEqual(t.last_advance_time(), 1010.0)
+
+    def test_height_decrease_does_not_update_advance(self):
+        t = IBDTracker()
+        t.update(200, now=1000.0)
+        t.update(300, now=1010.0)
+        self.assertEqual(t.last_advance_time(), 1010.0)
+        t.update(150, now=1020.0)
+        self.assertEqual(t.last_advance_time(), 1010.0)
+
+    def test_multiple_increases_tracks_last(self):
+        t = IBDTracker()
+        t.update(100, now=1000.0)
+        t.update(200, now=1010.0)
+        t.update(300, now=1020.0)
+        self.assertEqual(t.last_advance_time(), 1020.0)
+
+    def test_increase_after_decrease(self):
+        t = IBDTracker()
+        t.update(100, now=1000.0)
+        t.update(200, now=1010.0)
+        t.update(150, now=1020.0)
+        t.update(250, now=1030.0)
+        self.assertEqual(t.last_advance_time(), 1030.0)
+
+
+def _make_config(tmp_debug_log=None):
+    from server import Config
+    return Config(
+        host="127.0.0.1",
+        port=8787,
+        refresh=5,
+        timeout=5,
+        info_interval=60,
+        peer_interval=120,
+        max_backoff=30,
+        log_tail_bytes=262144,
+        innovad="innovad",
+        datadir=None,
+        conf=None,
+        debug_log=tmp_debug_log,
+        frontend=Path("/dev/null"),
+    )
+
+
+class TestBuildSnapshotNoCrash(unittest.TestCase):
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_with_fresh_tracker(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        peers = TimedValue()
+        blockchain = TimedValue()
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+        metrics = {"cpu_count": 1, "total_ram_bytes": 1024}
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics)
+        self.assertIsInstance(snap, dict)
+        self.assertIn("ibd", snap)
+        self.assertIsNone(snap["ibd"]["last_height_advance_ago_seconds"])
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_after_height_advance(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 100, "connections": 5})
+        peers = TimedValue()
+        peers.success([])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": True})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        now = time.time()
+        tracker.update(100, now=now - 60)
+        tracker.update(200, now=now)
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        self.assertIsInstance(snap, dict)
+        self.assertIn("ibd", snap)
+        self.assertIsNotNone(snap["ibd"]["last_height_advance_ago_seconds"])
+        self.assertGreaterEqual(snap["ibd"]["last_height_advance_ago_seconds"], 0)
+        self.assertEqual(snap["chain"]["height"], 100)
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_rpc_unavailable_is_not_http_failure(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.failure("RPC unavailable")
+        peers = TimedValue()
+        peers.failure("RPC unavailable")
+        blockchain = TimedValue()
+        blockchain.failure("RPC unavailable")
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        self.assertIsInstance(snap, dict)
+        self.assertFalse(snap["node"]["online"])
+        self.assertIn("ibd", snap)
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_connections_and_traffic(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 500, "connections": 12, "datareceived": 1024, "datasent": 2048})
+        peers = TimedValue()
+        peers.success([
+            {"inbound": True, "pingtime": 0.05},
+            {"inbound": False, "pingtime": 0.10},
+        ])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": False})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        net = snap["network"]
+        self.assertEqual(net["connections"], 12)
+        self.assertEqual(net["inbound"], 1)
+        self.assertEqual(net["outbound"], 1)
+        self.assertEqual(net["bytes_received"], 1024)
+        self.assertEqual(net["bytes_sent"], 2048)
+        self.assertIsNotNone(net["average_ping_ms"])
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_history_populated(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        peers = TimedValue()
+        blockchain = TimedValue()
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        self.assertIsInstance(snap["history"], list)
+        self.assertIsInstance(snap["features"], dict)
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_height_decrease_reindex_does_not_panic(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 50, "connections": 3})
+        peers = TimedValue()
+        peers.success([])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": True})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        now = time.time()
+        tracker.update(200, now=now - 120)
+        tracker.update(300, now=now - 60)
+        tracker.update(100, now=now)
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        self.assertIsInstance(snap, dict)
+        self.assertIn("ibd", snap)
+        self.assertEqual(snap["ibd"]["session_type"], "cold_ibd")
+
+
+class TestJSONEndpointPayload(unittest.TestCase):
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_full_snapshot_is_json_serializable(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 1000, "connections": 8, "version": "1.0", "datareceived": 4096, "datasent": 8192})
+        peers = TimedValue()
+        peers.success([{"inbound": True, "pingtime": 0.05}])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": True, "verificationprogress": 0.99})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        now = time.time()
+        tracker.update(900, now=now - 120)
+        tracker.update(1000, now=now)
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={"cpu_count": 2})
+        payload = json.dumps(snap, ensure_ascii=False, separators=(",", ":")).encode()
+        parsed = json.loads(payload)
+        self.assertEqual(parsed["chain"]["height"], 1000)
+        self.assertIn("last_height_advance_ago_seconds", parsed["ibd"])
+        self.assertIsNotNone(parsed["network"]["connections"])
+        self.assertIsNotNone(parsed["network"]["bytes_received"])
+        self.assertIsNotNone(parsed["network"]["bytes_sent"])
 
 
 if __name__ == "__main__":

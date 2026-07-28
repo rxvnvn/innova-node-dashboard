@@ -173,6 +173,7 @@ class IBDTracker:
         self.session_observed_height: int | None = None
         self.last_height: int | None = None
         self.last_height_change: float = 0.0
+        self._last_advance_time: float | None = None
         self.ema_rate: float | None = None
         self.peaks: dict[str, int] = {
             "connections": 0,
@@ -191,10 +192,15 @@ class IBDTracker:
             self.last_height_change = now
             return
         if height != self.last_height:
+            if height > self.last_height:
+                self._last_advance_time = now
             self.last_height = height
             self.last_height_change = now
             if self.session_observed_height is not None and height > self.session_observed_height:
                 self.session_observed_height = height
+
+    def last_advance_time(self) -> float | None:
+        return self._last_advance_time
 
     def sync_state(self, ibd_rpc: bool | None, rpc_failures: int) -> str:
         if ibd_rpc is None and rpc_failures > 0:
