@@ -2,24 +2,33 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.3.0"
 API_VERSION = "v1"
 HEIGHT_RE = re.compile(rb"SetBestChain:.*?\bheight=(\d+)\b")
+
+MAX_SAMPLES = 360
+SAMPLE_INTERVAL = 10
+STALE_HEALTHY_S = 60
+STALE_SLOW_S = 180
+EMA_ALPHA = 0.15
+MIN_PEERS_FOR_ETA = 3
 
 
 @dataclass(frozen=True)
@@ -69,12 +78,251 @@ class TimedValue:
         return max(0, int((dt.datetime.now().astimezone() - self.updated_wall).total_seconds()))
 
 
+class IBDSampler:
+    def __init__(self, max_samples: int = MAX_SAMPLES) -> None:
+        self.max_samples = max_samples
+        self.samples: collections.deque = collections.deque(maxlen=max_samples)
+
+    def record(self, height: int | None, connections: int | None,
+               bytes_received: int | None, bytes_sent: int | None,
+               ibd: bool | None, estimated_tip: int | None,
+               blocks_inflight: int | None, ask_queue: int | None,
+               active_download_peers: int | None) -> None:
+        if height is None:
+            return
+        now = time.time()
+        if self.samples and self.samples[-1]["height"] == height:
+            s = self.samples[-1]
+            s["time"] = now
+            s["connections"] = connections or s["connections"]
+            s["bytes_received"] = bytes_received or s["bytes_received"]
+            s["bytes_sent"] = bytes_sent or s["bytes_sent"]
+            return
+        self.samples.append({
+            "time": now,
+            "height": height,
+            "connections": connections,
+            "bytes_received": bytes_received,
+            "bytes_sent": bytes_sent,
+            "ibd": ibd,
+            "estimated_tip": estimated_tip,
+            "blocks_inflight": blocks_inflight,
+            "ask_queue": ask_queue,
+            "active_download_peers": active_download_peers,
+        })
+
+    def window_average(self, seconds: float) -> float | None:
+        if not self.samples:
+            return None
+        now = time.time()
+        cutoff = now - seconds
+        heights = [s["height"] for s in self.samples if s["time"] >= cutoff]
+        if len(heights) < 2:
+            return None
+        blocks = heights[-1] - heights[0]
+        span = self.samples[-1]["time"] - max(self.samples[0]["time"], cutoff)
+        if span <= 0 or blocks < 0:
+            return None
+        return blocks / (span / 60.0)
+
+    def session_average(self, start_height: int) -> float | None:
+        if not self.samples or start_height is None:
+            return None
+        current = self.samples[-1]["height"]
+        first = self.samples[0]
+        blocks = current - start_height
+        elapsed = time.time() - first["time"]
+        if blocks <= 0 or elapsed <= 0:
+            return None
+        return blocks / (elapsed / 60.0)
+
+    def current_rate(self) -> float | None:
+        if len(self.samples) < 2:
+            return None
+        s1 = self.samples[-2]
+        s2 = self.samples[-1]
+        dt_sec = s2["time"] - s1["time"]
+        if dt_sec <= 0:
+            return None
+        dh = s2["height"] - s1["height"]
+        if dh < 0:
+            return None
+        return dh / (dt_sec / 60.0)
+
+    def last_advance_time(self) -> float | None:
+        if not self.samples:
+            return None
+        return self.samples[-1]["time"]
+
+    def to_history(self, limit: int = 60) -> list[dict]:
+        out = []
+        for s in list(self.samples)[-limit:]:
+            out.append({
+                "time": int(s["time"]),
+                "height": s["height"],
+                "connections": s.get("connections"),
+                "bytes_received": s.get("bytes_received"),
+                "bytes_sent": s.get("bytes_sent"),
+            })
+        return out
+
+
+class IBDTracker:
+    def __init__(self) -> None:
+        self.session_start_height: int | None = None
+        self.session_observed_height: int | None = None
+        self.last_height: int | None = None
+        self.last_height_change: float = 0.0
+        self.ema_rate: float | None = None
+        self.peaks: dict[str, int] = {
+            "connections": 0,
+            "blocks_inflight": 0,
+            "ask_queue": 0,
+        }
+
+    def update(self, height: int | None, now: float | None = None) -> None:
+        if height is None:
+            return
+        now = now or time.time()
+        if self.session_start_height is None:
+            self.session_start_height = height
+            self.session_observed_height = height
+            self.last_height = height
+            self.last_height_change = now
+            return
+        if height != self.last_height:
+            self.last_height = height
+            self.last_height_change = now
+            if self.session_observed_height is not None and height > self.session_observed_height:
+                self.session_observed_height = height
+
+    def sync_state(self, ibd_rpc: bool | None, rpc_failures: int) -> str:
+        if ibd_rpc is None and rpc_failures > 0:
+            return "rpc_unavailable"
+        if ibd_rpc is False:
+            return "synced"
+        if ibd_rpc is not True and rpc_failures == 0 and ibd_rpc is None:
+            return "unknown"
+        now = time.time()
+        elapsed = now - self.last_height_change if self.last_height_change else 999999
+        if elapsed < STALE_HEALTHY_S:
+            return "healthy"
+        if elapsed < STALE_SLOW_S:
+            return "slow"
+        return "stalled"
+
+    def update_ema(self, new_rate: float | None) -> None:
+        if new_rate is None:
+            return
+        if self.ema_rate is None:
+            self.ema_rate = new_rate
+        else:
+            self.ema_rate = EMA_ALPHA * new_rate + (1 - EMA_ALPHA) * self.ema_rate
+
+    def update_peaks(self, connections: int | None, inflight: int | None, askqueue: int | None) -> None:
+        if connections is not None:
+            self.peaks["connections"] = max(self.peaks["connections"], connections)
+        if inflight is not None:
+            self.peaks["blocks_inflight"] = max(self.peaks["blocks_inflight"], inflight)
+        if askqueue is not None:
+            self.peaks["ask_queue"] = max(self.peaks["ask_queue"], askqueue)
+
+
+def compute_eta(ema_rate: float | None, current_height: int | None,
+                target_height: int | None) -> float | None:
+    if ema_rate is None or current_height is None or target_height is None:
+        return None
+    remaining = target_height - current_height
+    if remaining <= 0 or ema_rate <= 0:
+        return None
+    return remaining / ema_rate * 60.0
+
+
+def estimate_network_height(peers: list[dict], current_height: int | None) -> int | None:
+    if not peers or current_height is None:
+        return None
+    heights = []
+    for peer in peers:
+        h = as_int(peer.get("startingheight"))
+        if h is None or h <= 0:
+            continue
+        if current_height > 0 and h > current_height * 2.5:
+            continue
+        if current_height > 0 and h < current_height * 0.5:
+            continue
+        heights.append(h)
+    if not heights:
+        return None
+    heights.sort()
+    if len(heights) == 1:
+        return heights[0]
+    q75 = heights[int(len(heights) * 0.75)]
+    return q75
+
+
+def aggregate_peers(peers: list[dict]) -> dict[str, Any]:
+    active_download = 0
+    total_inflight = 0
+    total_askqueue = 0
+    details = []
+    for peer in peers:
+        inflight = as_int(peer.get("blocksinflight")) or 0
+        askqueue = as_int(peer.get("askqueuesize")) or 0
+        total_inflight += inflight
+        total_askqueue += askqueue
+        is_active = inflight > 0
+        if is_active:
+            active_download += 1
+        details.append({
+            "addr": peer.get("addr", ""),
+            "starting_height": as_int(peer.get("startingheight")),
+            "bytes_received": as_int(peer.get("bytesrecv")),
+            "bytes_sent": as_int(peer.get("bytessent")),
+            "blocks_inflight": inflight,
+            "ask_queue": askqueue,
+            "pingtime": as_float(peer.get("pingtime")),
+            "lastsend": as_int(peer.get("lastsend")),
+            "lastrecv": as_int(peer.get("lastrecv")),
+            "connection_age": as_int(peer.get("conntime")),
+        })
+    return {
+        "active_download_peers": active_download,
+        "total_blocks_inflight": total_inflight,
+        "total_ask_queue": total_askqueue,
+        "details": details,
+    }
+
+
+def host_metrics() -> dict[str, Any]:
+    cpu_count = os.cpu_count()
+    total_ram_bytes = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        total_ram_bytes = int(parts[1]) * 1024
+                    break
+    except (OSError, ValueError):
+        pass
+    return {
+        "cpu_count": cpu_count,
+        "total_ram_bytes": total_ram_bytes,
+    }
+
+
 class Collector:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.lock = threading.Lock()
         self.info = TimedValue()
         self.peers = TimedValue()
+        self.blockchain = TimedValue()
+        self.ibd_tracker = IBDTracker()
+        self.sampler = IBDSampler()
+        self.metrics = host_metrics()
+        self._last_sample_time = 0.0
 
     def rpc_json(self, method: str) -> tuple[Any | None, str | None]:
         code, output, error = rpc(self.config, [method])
@@ -100,10 +348,37 @@ class Collector:
             else:
                 self.peers.failure(f"RPC busy: getpeerinfo unavailable ({error or 'invalid response'})")
 
+        if self.blockchain.due(self.config.info_interval, self.config.max_backoff):
+            value, error = self.rpc_json("getblockchaininfo")
+            if error is None and isinstance(value, dict):
+                self.blockchain.success(value)
+            else:
+                self.blockchain.failure(f"RPC busy: getblockchaininfo unavailable ({error or 'invalid response'})")
+
     def collect(self) -> dict[str, Any]:
         with self.lock:
             self.refresh_rpc()
-            return build_snapshot(self.config, self.info, self.peers)
+            snapshot = build_snapshot(self.config, self.info, self.peers, self.blockchain,
+                                     self.ibd_tracker, self.sampler, self.metrics)
+            now_mono = time.time()
+            if now_mono - self._last_sample_time >= SAMPLE_INTERVAL:
+                chain = snapshot.get("chain", {})
+                net = snapshot.get("network", {})
+                ibd_sec = snapshot.get("ibd", {})
+                peer_agg = ibd_sec.get("peer_aggregation", {})
+                self.sampler.record(
+                    height=chain.get("height"),
+                    connections=net.get("connections"),
+                    bytes_received=net.get("bytes_received"),
+                    bytes_sent=net.get("bytes_sent"),
+                    ibd=chain.get("initial_block_download"),
+                    estimated_tip=ibd_sec.get("estimated_tip"),
+                    blocks_inflight=peer_agg.get("total_blocks_inflight"),
+                    ask_queue=peer_agg.get("total_ask_queue"),
+                    active_download_peers=peer_agg.get("active_download_peers"),
+                )
+                self._last_sample_time = now_mono
+            return snapshot
 
 
 def run(command: list[str], timeout: int) -> tuple[int, str, str]:
@@ -215,14 +490,20 @@ def iso(value: dt.datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedValue) -> dict[str, Any]:
+def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedValue,
+                   blockchain_state: TimedValue, ibd_tracker: IBDTracker,
+                   sampler: IBDSampler, metrics: dict[str, Any]) -> dict[str, Any]:
     now = dt.datetime.now().astimezone()
     info = info_state.value if isinstance(info_state.value, dict) else {}
     peers = peers_state.value if isinstance(peers_state.value, list) else []
+    blockchain = blockchain_state.value if isinstance(blockchain_state.value, dict) else {}
+
     log_height, log_updated = read_log_height(config.debug_log, config.log_tail_bytes)
     rpc_height = as_int(info.get("blocks"))
     height = log_height if log_height is not None else rpc_height
     height_source = "debug_log" if log_height is not None else ("rpc" if rpc_height is not None else None)
+
+    ibd_rpc = blockchain.get("initialblockdownload") if isinstance(blockchain.get("initialblockdownload"), bool) else info.get("initialblockdownload")
 
     pid = process_pid(config)
     started_at, uptime_seconds = process_times(pid, config)
@@ -231,9 +512,47 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     pings = [as_float(peer.get("pingtime")) for peer in peers]
     pings = [ping for ping in pings if ping is not None]
 
-    notices = [notice for notice in (info_state.warning, peers_state.warning) if notice]
+    rpc_ok = info_state.failures == 0 or peers_state.failures == 0
+    rpc_failures = max(info_state.failures, peers_state.failures)
+
+    ibd_tracker.update(height)
+    current_rate = sampler.current_rate()
+    ibd_tracker.update_ema(current_rate)
+
+    peer_agg = aggregate_peers(peers)
+    estimated_tip = estimate_network_height(peers, height)
+
+    ibd_tracker.update_peaks(
+        as_int(info.get("connections")) or (len(peers) if peers else None),
+        peer_agg["total_blocks_inflight"],
+        peer_agg["total_ask_queue"],
+    )
+
+    sync_state = ibd_tracker.sync_state(ibd_rpc, rpc_failures)
+
+    session_start = ibd_tracker.session_start_height
+    session_type = "unknown"
+    if session_start is not None:
+        if session_start < 1000:
+            session_type = "cold_ibd"
+        else:
+            session_type = "resume_ibd"
+    if sync_state == "synced":
+        session_type = "synced"
+
+    session_rate = sampler.session_average(session_start) if session_start is not None else None
+    rate_5min = sampler.window_average(300)
+    eta_seconds = compute_eta(ibd_tracker.ema_rate, height, estimated_tip)
+
+    last_advance = ibd_tracker.last_advance_time()
+    last_advance_ago = None
+    if last_advance:
+        last_advance_ago = max(0, int(time.time() - last_advance))
+
+    notices = [notice for notice in (info_state.warning, peers_state.warning, blockchain_state.warning) if notice]
+
     return {
-        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 2},
+        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 3},
         "dashboard": {"version": APP_VERSION},
         "generated_at": now.isoformat(),
         "node": {
@@ -243,7 +562,6 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "build_commit": info.get("buildcommit"),
             "build_dirty": info.get("builddirty"),
             "protocol_version": info.get("protocolversion"),
-            "pid": pid,
             "started_at": iso(started_at),
             "uptime_seconds": uptime_seconds,
         },
@@ -251,9 +569,10 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "height": height,
             "height_source": height_source,
             "height_updated_at": iso(log_updated if height_source == "debug_log" else info_state.updated_wall),
-            "initial_block_download": info.get("initialblockdownload"),
+            "initial_block_download": ibd_rpc,
             "difficulty": info.get("difficulty"),
             "money_supply": info.get("moneysupply"),
+            "verification_progress": as_float(blockchain.get("verificationprogress")),
         },
         "network": {
             "connections": as_int(info.get("connections")) if info.get("connections") is not None else (len(peers) if peers else None),
@@ -263,17 +582,41 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "bytes_received": info.get("datareceived"),
             "bytes_sent": info.get("datasent"),
         },
+        "ibd": {
+            "session_type": session_type,
+            "session_start_height": session_start,
+            "estimated_tip": estimated_tip,
+            "current_rate_bpm": round(current_rate, 2) if current_rate is not None else None,
+            "rate_5min_bpm": round(rate_5min, 2) if rate_5min is not None else None,
+            "rate_ema_bpm": round(ibd_tracker.ema_rate, 2) if ibd_tracker.ema_rate is not None else None,
+            "session_rate_bpm": round(session_rate, 2) if session_rate is not None else None,
+            "eta_seconds": round(eta_seconds) if eta_seconds is not None and eta_seconds < 1e9 else None,
+            "last_height_advance_ago_seconds": last_advance_ago,
+            "sync_state": sync_state,
+            "peer_aggregation": {
+                "active_download_peers": peer_agg["active_download_peers"],
+                "total_blocks_inflight": peer_agg["total_blocks_inflight"],
+                "total_ask_queue": peer_agg["total_ask_queue"],
+                "peer_count": len(peers),
+            },
+            "peers": peer_agg["details"],
+        },
+        "host": metrics,
+        "history": sampler.to_history(60),
         "freshness": {
             "getinfo_age_seconds": info_state.age_seconds(),
             "getpeerinfo_age_seconds": peers_state.age_seconds(),
+            "getblockchaininfo_age_seconds": blockchain_state.age_seconds(),
             "getinfo_failures": info_state.failures,
             "getpeerinfo_failures": peers_state.failures,
+            "getblockchaininfo_failures": blockchain_state.failures,
         },
         "features": {
             "peers": bool(peers),
             "traffic": info.get("datareceived") is not None or info.get("datasent") is not None,
             "debug_log_height": log_height is not None,
-            "system_metrics": False,
+            "ibd_benchmark": True,
+            "host_metrics": bool(metrics.get("total_ram_bytes")),
         },
         "notices": notices,
         "errors": [],

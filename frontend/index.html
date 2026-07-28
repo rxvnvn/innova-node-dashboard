@@ -16,8 +16,71 @@
     <main>
       <section class="hero">
         <div><p class="label">Current height</p><div id="height" class="height">—</div></div>
-        <div class="heroMeta"><span id="ibd">Sync status unknown</span><span id="heightSource" class="source">Source unknown</span><span id="updated">Updating…</span></div>
+        <div class="heroMeta">
+          <span id="ibd">Sync status unknown</span>
+          <span id="heightSource" class="source">Source unknown</span>
+          <span id="updated">Updating…</span>
+        </div>
       </section>
+
+      <section id="ibdSection" class="ibd-section" hidden>
+        <div class="ibd-header">
+          <p class="label">IBD Benchmark</p>
+          <span id="syncState" class="sync-state unknown">Unknown</span>
+        </div>
+        <div class="ibd-progress">
+          <div class="ibd-progress-row">
+            <span id="ibdProgress" class="ibd-progress-text">— / —</span>
+            <span id="ibdPercent" class="ibd-progress-pct">—</span>
+          </div>
+          <div class="ibd-bar"><div id="ibdBarFill" class="ibd-bar-fill" style="width:0%"></div></div>
+        </div>
+        <div class="ibd-meta">
+          <div><span class="ibd-label">Session type</span><b id="sessionType">—</b></div>
+          <div><span class="ibd-label">Estimated network height</span><b id="estTip">—</b></div>
+          <div><span class="ibd-label">Daemon uptime</span><b id="ibdUptime">—</b></div>
+          <div><span class="ibd-label">Last height advance</span><b id="lastAdvance">—</b></div>
+        </div>
+      </section>
+
+      <section id="rateSection" class="rate-section" hidden>
+        <p class="label">Sync Speed</p>
+        <div class="rate-grid">
+          <div><span class="rate-val" id="rateCurrent">—</span><span class="rate-unit">blocks/min</span><span class="rate-name">Current</span></div>
+          <div><span class="rate-val" id="rate5min">—</span><span class="rate-unit">blocks/min</span><span class="rate-name">5-min avg</span></div>
+          <div><span class="rate-val" id="rateSession">—</span><span class="rate-unit">blocks/min</span><span class="rate-name">Session avg</span></div>
+          <div><span class="rate-val" id="etaVal">—</span><span class="rate-unit" id="etaUnit"></span><span class="rate-name">ETA remaining</span></div>
+        </div>
+      </section>
+
+      <section id="networkSection" class="net-section" hidden>
+        <p class="label">Network &amp; Peers</p>
+        <div class="net-grid">
+          <div><span class="net-val" id="netConnections">—</span><span class="net-name">Connections</span></div>
+          <div><span class="net-val" id="netActive">—</span><span class="net-name">Active download peers</span></div>
+          <div><span class="net-val" id="netInflight">—</span><span class="net-name">Blocks in flight</span></div>
+          <div><span class="net-val" id="netAskqueue">—</span><span class="net-name">Queued requests</span></div>
+          <div><span class="net-val" id="netReceived">—</span><span class="net-name">Received</span></div>
+          <div><span class="net-val" id="netSent">—</span><span class="net-name">Sent</span></div>
+        </div>
+        <details id="peerDetails" class="peer-details">
+          <summary>Peer list (<span id="peerCount">0</span>)</summary>
+          <div class="peer-table-wrap">
+            <table class="peer-table">
+              <thead><tr>
+                <th>Address</th><th>Start height</th><th>In flight</th><th>Ask queue</th><th>Rx</th><th>Tx</th><th>Ping</th>
+              </tr></thead>
+              <tbody id="peerTableBody"></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
+
+      <section id="heightGraphSection" class="graph-section" hidden>
+        <p class="label">Height history</p>
+        <canvas id="heightGraph" width="600" height="120"></canvas>
+      </section>
+
       <section class="grid">
         <article><p class="label">Node started</p><div id="started" class="value small">—</div></article>
         <article><p class="label">Node uptime</p><div id="uptime" class="value small">—</div></article>
@@ -26,10 +89,12 @@
         <article><p class="label">Received</p><div id="received" class="value small">—</div></article>
         <article><p class="label">Sent</p><div id="sent" class="value small">—</div></article>
       </section>
-      <section class="details">
+
+      <section id="hostSection" class="details" hidden>
         <div><span>Version</span><b id="version">—</b></div>
         <div><span>Build commit</span><b id="build">—</b></div>
-        <div><span>Node PID</span><b id="pid">—</b></div>
+        <div><span>CPU</span><b id="cpuCount">—</b></div>
+        <div><span>Total RAM</span><b id="totalRam">—</b></div>
         <div><span>API</span><b id="api">—</b></div>
       </section>
       <section class="freshness"><span id="rpcFreshness">Node info: never · Peers: never</span></section>
