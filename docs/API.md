@@ -2,14 +2,14 @@
 
 ## `GET /api/v1/status`
 
-Read-only JSON status endpoint. Schema 3 adds IBD benchmark data, peer aggregation, host metrics, and height history.
+Read-only JSON status endpoint. Schema 4 adds restored traffic counters (parsed byte totals), live throughput (`network.traffic`), and per-peer version fields.
 
 ### Top-level sections
 
 ```json
 {
-  "api": {"name": "innova-node-dashboard", "version": "v1", "schema": 3},
-  "dashboard": {"version": "0.3.0"},
+  "api": {"name": "innova-node-dashboard", "version": "v1", "schema": 4},
+  "dashboard": {"version": "0.3.1"},
   "generated_at": "2026-07-28T12:00:00+02:00",
   "node": { ... },
   "chain": { ... },
@@ -37,6 +37,30 @@ Read-only JSON status endpoint. Schema 3 adds IBD benchmark data, peer aggregati
 ```
 
 `verification_progress` comes from `getblockchaininfo`. Values near 1.0 indicate the node is nearly synced.
+
+### `network` — traffic & throughput
+
+```json
+{
+  "connections": 12,
+  "inbound": 2,
+  "outbound": 10,
+  "average_ping_ms": 221.4,
+  "bytes_received": 565183488,
+  "bytes_sent": 83919555,
+  "traffic": {
+    "received": 565183488,
+    "sent": 83919555,
+    "rx_rate_bps": 1243000.0,
+    "tx_rate_bps": 182000.0,
+    "source": "getinfo"
+  }
+}
+```
+
+**Cumulative counters.** `getinfo` returns `datareceived`/`datasent` as human-readable strings (for example `"537.48 MB"`). The backend parses them back to bytes. When `getinfo` totals are unavailable, per-peer byte counters are summed and `source` becomes `"peers"`.
+
+**Throughput.** `rx_rate_bps`/`tx_rate_bps` are derived from consecutive traffic samples (an average over the last counter update interval, normally one `getinfo` poll). No additional RPC polling is performed; the values are computed from data already being fetched.
 
 ### `ibd` — IBD benchmark
 
@@ -85,7 +109,9 @@ Read-only JSON status endpoint. Schema 3 adds IBD benchmark data, peer aggregati
 - `rpc_unavailable` — RPC calls failing
 - `unknown` — cannot determine state
 
-**`peers`** — array of per-peer details with `addr`, `starting_height`, `blocks_inflight`, `ask_queue`, `bytes_received`, `bytes_sent`, `pingtime`.
+**`peers`** — array of per-peer details with `addr`, `version` (user agent, e.g. `/innova:5.0.1/`), `protocol_version`, `starting_height`, `best_known_height`, `blocks_inflight`, `ask_queue`, `bytes_received`, `bytes_sent`, `pingtime`.
+
+The daemon reports per-peer sent bytes as `bytessend` (not `bytessent`); the backend reads the correct field. `best_known_height` is the peer-reported chain tip and is shown under Start height when the daemon does not expose a starting height.
 
 ### `host` — host metrics
 

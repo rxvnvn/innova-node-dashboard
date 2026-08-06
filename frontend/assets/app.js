@@ -6,11 +6,15 @@ function text(id, v, f = '—') {
 }
 function integer(v) {
   if (v === null || v === undefined) return '—';
-  return new Intl.NumberFormat('ru-RU', { useGrouping: true, maximumFractionDigits: 0 }).format(Number(v)).replace(/\u00a0|\u202f/g, ' ');
+  const n = Number(v);
+  if (isNaN(n)) return '—';
+  return new Intl.NumberFormat('ru-RU', { useGrouping: true, maximumFractionDigits: 0 }).format(n).replace(/\u00a0|\u202f/g, ' ');
 }
 function decimal(v) {
   if (v === null || v === undefined) return '—';
-  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(Number(v));
+  const n = Number(v);
+  if (isNaN(n)) return '—';
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(n);
 }
 function date(v) {
   if (!v) return 'unknown';
@@ -34,6 +38,27 @@ function bytesHuman(v) {
   let i = 0, s = n;
   while (s >= 1024 && i < units.length - 1) { s /= 1024; i++; }
   return `${i === 0 ? s : s.toFixed(1)} ${units[i]}`;
+}
+function speedHuman(v) {
+  if (v === null || v === undefined) return '—';
+  const n = Number(v);
+  if (isNaN(n) || n < 0) return '—';
+  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+  let i = 0, s = n;
+  while (s >= 1024 && i < units.length - 1) { s /= 1024; i++; }
+  return `${i === 0 ? s.toFixed(0) : s.toFixed(1)} ${units[i]}`;
+}
+function pingClass(ms) {
+  if (ms == null) return '';
+  if (ms < 100) return 'ping-good';
+  if (ms < 300) return 'ping-warn';
+  return 'ping-bad';
+}
+function relativeAgo(iso) {
+  if (!iso) return 'Updating…';
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return 'Updating…';
+  return `Updated ${ageLabel(Math.max(0, Math.round((Date.now() - t) / 1000)))}`;
 }
 function badge(online) {
   $('badge').className = 'badge ' + (online === true ? 'online' : online === false ? 'offline' : 'unknown');
@@ -63,7 +88,7 @@ function drawHeightGraph(canvas, history) {
   if (!canvas || !history || history.length < 2) return;
   const ctx = canvas.getContext('2d');
   const W = canvas.width = canvas.offsetWidth * (window.devicePixelRatio || 1);
-  const H = canvas.height = 120 * (window.devicePixelRatio || 1);
+  const H = canvas.height = (canvas.offsetHeight || 90) * (window.devicePixelRatio || 1);
   ctx.clearRect(0, 0, W, H);
   const heights = history.map(h => h.height);
   const minH = Math.min(...heights), maxH = Math.max(...heights);
@@ -98,21 +123,25 @@ function drawHeightGraph(canvas, history) {
 
 function renderPeerTable(peers) {
   const tbody = $('peerTableBody');
-  if (!peers || !peers.length) { tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#8f9bae">No peers</td></tr>'; return; }
+  if (!peers || !peers.length) { tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8f9bae">No peers</td></tr>'; return; }
   const sorted = [...peers].sort((a, b) => (b.blocks_inflight || 0) - (a.blocks_inflight || 0));
-  tbody.innerHTML = sorted.map(p => `<tr>
+  tbody.innerHTML = sorted.map(p => {
+    const startH = p.starting_height != null ? integer(p.starting_height) : (p.best_known_height != null ? integer(p.best_known_height) : '—');
+    const ver = p.version ? esc(String(p.version).replace(/^\/+|\/+$/g, '')) : (p.protocol_version != null ? `v${p.protocol_version}` : '—');
+    const pingMs = p.pingtime != null ? p.pingtime * 1000 : null;
+    return `<tr>
     <td>${esc(p.addr || '—')}</td>
-    <td>${integer(p.starting_height)}</td>
+    <td>${ver}</td>
+    <td>${startH}</td>
     <td>${p.blocks_inflight || 0}</td>
     <td>${p.ask_queue || 0}</td>
     <td>${bytesHuman(p.bytes_received)}</td>
     <td>${bytesHuman(p.bytes_sent)}</td>
-    <td>${p.pingtime != null ? (p.pingtime * 1000).toFixed(1) + ' ms' : '—'}</td>
-  </tr>`).join('');
+    <td class="${pingClass(pingMs)}">${pingMs != null ? pingMs.toFixed(1) + ' ms' : '—'}</td>
+  </tr>`;
+  }).join('');
 }
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-
-let prevHeight = null;
 
 function render(s) {
   const n = s.node || {}, c = s.chain || {}, w = s.network || {}, f = s.freshness || {};
@@ -127,7 +156,11 @@ function render(s) {
   text('connections', integer(w.connections));
   text('inbound', integer(w.inbound));
   text('outbound', integer(w.outbound));
-  text('ping', w.average_ping_ms == null ? '—' : `${decimal(w.average_ping_ms)} ms`);
+  const avgPing = w.average_ping_ms;
+  const pingEl = $('ping');
+  pingEl.textContent = avgPing == null ? '—' : `${decimal(avgPing)} ms`;
+  pingEl.classList.remove('ping-good', 'ping-warn', 'ping-bad');
+  if (avgPing != null) pingEl.classList.add(pingClass(avgPing));
   text('received', bytesHuman(w.bytes_received));
   text('sent', bytesHuman(w.bytes_sent));
   text('version', n.version);
@@ -136,7 +169,7 @@ function render(s) {
   text('dashVersion', s.dashboard?.version);
 
   text('ibd', c.initial_block_download === true ? 'IBD — synchronization in progress' : c.initial_block_download === false ? 'Synchronization complete' : c.height != null ? 'Node active · RPC sync state cached' : 'Sync status unknown');
-  text('updated', `Dashboard updated: ${date(s.generated_at)}`);
+  text('updated', relativeAgo(s.generated_at));
   text('rpcFreshness', `Node info: ${ageLabel(f.getinfo_age_seconds)} · Peers: ${ageLabel(f.getpeerinfo_age_seconds)}`);
 
   // IBD section
@@ -177,6 +210,7 @@ function render(s) {
 
   // Network section
   const agg = ibd.peer_aggregation || {};
+  const tr = w.traffic || {};
   const netVisible = agg.peer_count != null;
   $('networkSection').hidden = !netVisible;
   if (netVisible) {
@@ -184,8 +218,10 @@ function render(s) {
     text('netActive', integer(agg.active_download_peers));
     text('netInflight', integer(agg.total_blocks_inflight));
     text('netAskqueue', integer(agg.total_ask_queue));
-    text('netReceived', bytesHuman(w.bytes_received));
-    text('netSent', bytesHuman(w.bytes_sent));
+    text('netRxRate', speedHuman(tr.rx_rate_bps));
+    text('netTxRate', speedHuman(tr.tx_rate_bps));
+    text('netReceived', bytesHuman(tr.received ?? w.bytes_received));
+    text('netSent', bytesHuman(tr.sent ?? w.bytes_sent));
     text('peerCount', integer(agg.peer_count));
     renderPeerTable(peers);
   }
@@ -201,12 +237,6 @@ function render(s) {
   if (hostVisible) {
     text('cpuCount', h.cpu_count != null ? `${h.cpu_count} cores` : '—');
     text('totalRam', bytesHuman(h.total_ram_bytes));
-  }
-
-  // Existing details section: repurpose pid row
-  const detailsEl = $('hostSection');
-  if (!detailsEl.hidden) {
-    // pid row was in original, now removed from HTML
   }
 
   const notices = Array.isArray(s.notices) ? s.notices.filter(Boolean) : [];

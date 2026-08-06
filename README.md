@@ -113,6 +113,20 @@ The dashboard is read-only and does not expose arbitrary RPC execution or creden
 
 Serve the same static frontend and implement `GET /api/v1/status` in the daemon according to `docs/API.md`. The frontend contains no Python-specific code.
 
+## Version 0.3.1
+
+UX polish iteration — same architecture, same RPC load, more information per pixel:
+
+- **Compact header** — brand and online badge on one line; header is ~50% shorter
+- **Compact hero** — Current height remains the dominant element; right-side sync/source status moved to a single row
+- **Peer Version column** — shows each peer's user agent (`/innova:5.0.1/`) or protocol version
+- **Peer start height** — populated from the peer-reported chain height when the daemon does not report a start height
+- **Traffic counters restored** — `datareceived`/`datasent` are returned as human strings (`"537.48 MB"`) by `getinfo`; they are now parsed to bytes. Per-peer sent bytes use the daemon's `bytessend` field (the RPC exposes a typo, not `bytessent`)
+- **Live traffic speed** — `↓ RX speed` / `↑ TX speed` in the Network & Peers panel, derived from the existing traffic samples (no extra RPC polling)
+- **Ping color coding** — green (< 100 ms), yellow (100–300 ms), red (> 300 ms) on both the average ping and per-peer ping values
+- **Height history** — tighter graph spacing, and the section is prepared for selectable time ranges (toolbar scaffold, currently hidden)
+- API schema bumped to 4 with the new `network.traffic` object and peer `version`/`best_known_height` fields
+
 ## Version 0.3.0
 
 - IBD Benchmark monitoring panel with progress, speed, ETA, sync state

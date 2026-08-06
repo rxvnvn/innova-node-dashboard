@@ -10,15 +10,17 @@
 <body>
   <div class="shell">
     <header>
-      <div><p class="eyebrow">INNOVA NODE</p><h1>Dashboard</h1></div>
+      <div class="brand"><span class="eyebrow">Innova node</span><h1>Dashboard</h1></div>
       <div id="badge" class="badge unknown"><span class="dot"></span><span id="status">Checking</span></div>
     </header>
     <main>
       <section class="hero">
         <div><p class="label">Current height</p><div id="height" class="height">—</div></div>
         <div class="heroMeta">
-          <span id="ibd">Sync status unknown</span>
-          <span id="heightSource" class="source">Source unknown</span>
+          <div class="heroMetaRow">
+            <span id="ibd">Sync status unknown</span>
+            <span id="heightSource" class="source">Source unknown</span>
+          </div>
           <span id="updated">Updating…</span>
         </div>
       </section>
@@ -60,6 +62,8 @@
           <div><span class="net-val" id="netActive">—</span><span class="net-name">Active download peers</span></div>
           <div><span class="net-val" id="netInflight">—</span><span class="net-name">Blocks in flight</span></div>
           <div><span class="net-val" id="netAskqueue">—</span><span class="net-name">Queued requests</span></div>
+          <div><span class="net-val" id="netRxRate">—</span><span class="net-name">↓ RX speed</span></div>
+          <div><span class="net-val" id="netTxRate">—</span><span class="net-name">↑ TX speed</span></div>
           <div><span class="net-val" id="netReceived">—</span><span class="net-name">Received</span></div>
           <div><span class="net-val" id="netSent">—</span><span class="net-name">Sent</span></div>
         </div>
@@ -68,7 +72,7 @@
           <div class="peer-table-wrap">
             <table class="peer-table">
               <thead><tr>
-                <th>Address</th><th>Start height</th><th>In flight</th><th>Ask queue</th><th>Rx</th><th>Tx</th><th>Ping</th>
+                <th>Address</th><th>Version</th><th>Start height</th><th>In flight</th><th>Ask queue</th><th>Rx</th><th>Tx</th><th>Ping</th>
               </tr></thead>
               <tbody id="peerTableBody"></tbody>
             </table>
@@ -77,8 +81,15 @@
       </section>
 
       <section id="heightGraphSection" class="graph-section" hidden>
-        <p class="label">Height history</p>
-        <canvas id="heightGraph" width="600" height="120"></canvas>
+        <div class="graph-head">
+          <p class="label">Height history</p>
+          <div id="graphRange" class="graph-range" hidden>
+            <button class="range-btn active" data-seconds="600">10m</button>
+            <button class="range-btn" data-seconds="3600">1h</button>
+            <button class="range-btn" data-seconds="21600">6h</button>
+          </div>
+        </div>
+        <canvas id="heightGraph" width="600" height="90"></canvas>
       </section>
 
       <section class="grid">

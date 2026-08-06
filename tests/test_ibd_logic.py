@@ -17,13 +17,81 @@ from server import (
     IBDSampler,
     IBDTracker,
     TimedValue,
+    TrafficTracker,
     aggregate_peers,
     as_float,
     as_int,
     build_snapshot,
     compute_eta,
     estimate_network_height,
+    parse_bytes,
 )
+
+
+class TestParseBytes(unittest.TestCase):
+    def test_integer(self):
+        self.assertEqual(parse_bytes(1024), 1024)
+        self.assertEqual(parse_bytes(0), 0)
+
+    def test_human_strings(self):
+        self.assertEqual(parse_bytes("512 B"), 512)
+        self.assertEqual(parse_bytes("1 KB"), 1024)
+        self.assertEqual(parse_bytes("537.48 MB"), int(round(537.48 * 1024 ** 2)))
+        self.assertEqual(parse_bytes("1.5 GB"), int(round(1.5 * 1024 ** 3)))
+
+    def test_float_string(self):
+        self.assertEqual(parse_bytes("42.0"), 42)
+
+    def test_invalid(self):
+        self.assertIsNone(parse_bytes(None))
+        self.assertIsNone(parse_bytes("abc"))
+        self.assertIsNone(parse_bytes(True))
+
+
+class TestTrafficTracker(unittest.TestCase):
+    def test_rates(self):
+        t = TrafficTracker()
+        now = time.time()
+        t.samples.append((now, 0, 0))
+        t.samples.append((now + 60, 1024 * 60, 0))
+        rx, tx = t.rates()
+        self.assertAlmostEqual(rx, 1024.0)
+        self.assertEqual(tx, 0.0)
+
+    def test_no_samples(self):
+        t = TrafficTracker()
+        self.assertEqual(t.rates(), (None, None))
+
+    def test_single_sample(self):
+        t = TrafficTracker()
+        t.samples.append((time.time(), 100, 100))
+        self.assertEqual(t.rates(), (None, None))
+
+    def test_record_dedupe_and_rate(self):
+        t = TrafficTracker()
+        now = time.time()
+        t.record(0, 0)
+        t.record(0, 0)
+        t.record(0, 0)
+        self.assertEqual(len(t.samples), 1)
+        t.samples[-1] = (now, 0, 0)
+        t.record(2048, 0)
+        rx, tx = t.rates()
+        self.assertIsNotNone(rx)
+
+    def test_record_resets_on_counter_reset(self):
+        t = TrafficTracker()
+        t.record(5000, 5000)
+        t.record(6000, 6000)
+        t.record(100, 100)
+        self.assertEqual(len(t.samples), 1)
+        self.assertEqual(t.samples[-1], (t.samples[-1][0], 100, 100))
+
+    def test_none_skipped(self):
+        t = TrafficTracker()
+        t.record(None, 5)
+        t.record(5, None)
+        self.assertEqual(len(t.samples), 0)
 
 
 class TestAsInt(unittest.TestCase):
@@ -146,6 +214,22 @@ class TestAggregatePeers(unittest.TestCase):
         result = aggregate_peers(peers)
         self.assertEqual(result["total_blocks_inflight"], 0)
         self.assertEqual(result["total_ask_queue"], 0)
+
+    def test_version_fields(self):
+        peers = [{"addr": "1.2.3.4:8333", "subver": "/innova:5.0.1/", "version": 50000}]
+        result = aggregate_peers(peers)
+        self.assertEqual(result["details"][0]["version"], "/innova:5.0.1/")
+        self.assertEqual(result["details"][0]["protocol_version"], 50000)
+
+    def test_bytessend_fallback(self):
+        peers = [{"addr": "1.2.3.4:8333", "bytessend": 2048}]
+        result = aggregate_peers(peers)
+        self.assertEqual(result["details"][0]["bytes_sent"], 2048)
+
+    def test_best_known_height(self):
+        peers = [{"addr": "1.2.3.4:8333", "bestknownheight": 1000}]
+        result = aggregate_peers(peers)
+        self.assertEqual(result["details"][0]["best_known_height"], 1000)
 
 
 class TestIBDTracker(unittest.TestCase):
@@ -506,6 +590,92 @@ class TestBuildSnapshotNoCrash(unittest.TestCase):
         self.assertIsInstance(snap, dict)
         self.assertFalse(snap["node"]["online"])
         self.assertIn("ibd", snap)
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_traffic_string_getinfo(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 500, "connections": 12, "datareceived": "537.48 MB", "datasent": "80.02 MB"})
+        peers = TimedValue()
+        peers.success([])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": False})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+        traffic = TrafficTracker()
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, traffic=traffic)
+        net = snap["network"]
+        self.assertEqual(net["bytes_received"], int(round(537.48 * 1024 ** 2)))
+        self.assertEqual(net["bytes_sent"], int(round(80.02 * 1024 ** 2)))
+        self.assertEqual(net["traffic"]["received"], net["bytes_received"])
+        self.assertEqual(net["traffic"]["source"], "getinfo")
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_traffic_peer_fallback(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 500, "connections": 12})
+        peers = TimedValue()
+        peers.success([
+            {"addr": "1.2.3.4:8333", "bytesrecv": 1024, "bytessend": 2048},
+            {"addr": "5.6.7.8:8333", "bytesrecv": 4096, "bytessend": 256},
+        ])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": False})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        net = snap["network"]
+        self.assertEqual(net["bytes_received"], 5120)
+        self.assertEqual(net["bytes_sent"], 2304)
+        self.assertEqual(net["traffic"]["source"], "peers")
+        self.assertEqual(snap["features"]["traffic"], True)
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_no_traffic(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 500, "connections": 3})
+        peers = TimedValue()
+        peers.success([])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": True})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        self.assertIsNone(snap["network"]["bytes_received"])
+        self.assertIsNone(snap["network"]["traffic"]["rx_rate_bps"])
+        self.assertEqual(snap["features"]["traffic"], False)
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_traffic_rates_over_time(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 500, "connections": 3, "datareceived": 0, "datasent": 0})
+        peers = TimedValue()
+        peers.success([])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": True})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+        traffic = TrafficTracker()
+
+        build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, traffic=traffic)
+        info2 = TimedValue()
+        info2.success({"blocks": 500, "connections": 3, "datareceived": 6000, "datasent": 0})
+        now = time.time()
+        traffic.samples[-1] = (now, 0, 0)
+        snap = build_snapshot(config, info2, peers, blockchain, tracker, sampler, metrics={}, traffic=traffic)
+        rate = snap["network"]["traffic"]["rx_rate_bps"]
+        self.assertIsNotNone(rate)
+        self.assertGreater(rate, 0)
 
     @patch("server.process_times", return_value=(None, None))
     @patch("server.process_pid", return_value=None)

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 API_VERSION = "v1"
 HEIGHT_RE = re.compile(rb"SetBestChain:.*?\bheight=(\d+)\b")
 
@@ -29,6 +29,8 @@ STALE_HEALTHY_S = 60
 STALE_SLOW_S = 180
 EMA_ALPHA = 0.15
 MIN_PEERS_FOR_ETA = 3
+
+BYTE_UNITS = {"": 1, "B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
 
 
 @dataclass(frozen=True)
@@ -279,11 +281,17 @@ def aggregate_peers(peers: list[dict]) -> dict[str, Any]:
         is_active = inflight > 0
         if is_active:
             active_download += 1
+        bytes_sent = parse_bytes(peer.get("bytessent"))
+        if bytes_sent is None:
+            bytes_sent = parse_bytes(peer.get("bytessend"))
         details.append({
             "addr": peer.get("addr", ""),
+            "version": peer.get("subver"),
+            "protocol_version": as_int(peer.get("version")),
             "starting_height": as_int(peer.get("startingheight")),
-            "bytes_received": as_int(peer.get("bytesrecv")),
-            "bytes_sent": as_int(peer.get("bytessent")),
+            "best_known_height": as_int(peer.get("bestknownheight")) or as_int(peer.get("chainheight")),
+            "bytes_received": parse_bytes(peer.get("bytesrecv")),
+            "bytes_sent": bytes_sent,
             "blocks_inflight": inflight,
             "ask_queue": askqueue,
             "pingtime": as_float(peer.get("pingtime")),
@@ -327,6 +335,7 @@ class Collector:
         self.blockchain = TimedValue()
         self.ibd_tracker = IBDTracker()
         self.sampler = IBDSampler()
+        self.traffic = TrafficTracker()
         self.metrics = host_metrics()
         self._last_sample_time = 0.0
 
@@ -365,7 +374,7 @@ class Collector:
         with self.lock:
             self.refresh_rpc()
             snapshot = build_snapshot(self.config, self.info, self.peers, self.blockchain,
-                                     self.ibd_tracker, self.sampler, self.metrics)
+                                     self.ibd_tracker, self.sampler, self.metrics, self.traffic)
             now_mono = time.time()
             if now_mono - self._last_sample_time >= SAMPLE_INTERVAL:
                 chain = snapshot.get("chain", {})
@@ -492,13 +501,61 @@ def as_float(value: Any) -> float | None:
         return None
 
 
+def parse_bytes(value: Any) -> int | None:
+    """Parse a byte counter that may be an int or a human string ("537.48 MB")."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        match = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)?\s*$", value, re.IGNORECASE)
+        if not match:
+            return None
+        number = float(match.group(1))
+        unit = (match.group(2) or "").upper().replace("I", "")
+        factor = BYTE_UNITS.get(unit)
+        if factor is None:
+            return None
+        return int(round(number * factor))
+    return None
+
+
+class TrafficTracker:
+    """Ring buffer of cumulative traffic samples used to derive throughput."""
+
+    def __init__(self, max_samples: int = 120) -> None:
+        self.max_samples = max_samples
+        self.samples: collections.deque = collections.deque(maxlen=max_samples)
+
+    def record(self, received: int | None, sent: int | None) -> None:
+        if received is None or sent is None:
+            return
+        now = time.time()
+        if self.samples and (received < self.samples[-1][1] or sent < self.samples[-1][2]):
+            self.samples.clear()
+        if self.samples and self.samples[-1][1] == received and self.samples[-1][2] == sent:
+            self.samples[-1] = (now, received, sent)
+            return
+        self.samples.append((now, received, sent))
+
+    def rates(self) -> tuple[float | None, float | None]:
+        if len(self.samples) < 2:
+            return None, None
+        (t0, r0, s0), (t1, r1, s1) = self.samples[-2], self.samples[-1]
+        span = t1 - t0
+        if span <= 0:
+            return None, None
+        return (r1 - r0) / span, (s1 - s0) / span
+
+
 def iso(value: dt.datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
 def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedValue,
                    blockchain_state: TimedValue, ibd_tracker: IBDTracker,
-                   sampler: IBDSampler, metrics: dict[str, Any]) -> dict[str, Any]:
+                   sampler: IBDSampler, metrics: dict[str, Any],
+                   traffic: TrafficTracker | None = None) -> dict[str, Any]:
     now = dt.datetime.now().astimezone()
     info = info_state.value if isinstance(info_state.value, dict) else {}
     peers = peers_state.value if isinstance(peers_state.value, list) else []
@@ -527,6 +584,21 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
 
     peer_agg = aggregate_peers(peers)
     estimated_tip = estimate_network_height(peers, height)
+
+    traffic_received = parse_bytes(info.get("datareceived"))
+    traffic_sent = parse_bytes(info.get("datasent"))
+    traffic_source = "getinfo"
+    if traffic_received is None and peers:
+        traffic_received = sum(p["bytes_received"] or 0 for p in peer_agg["details"])
+        traffic_source = "peers"
+    if traffic_sent is None and peers:
+        traffic_sent = sum(p["bytes_sent"] or 0 for p in peer_agg["details"])
+        traffic_source = "peers"
+    if traffic_received is None and traffic_sent is None:
+        traffic_source = None
+    if traffic is not None:
+        traffic.record(traffic_received, traffic_sent)
+    rx_rate, tx_rate = traffic.rates() if traffic is not None else (None, None)
 
     ibd_tracker.update_peaks(
         as_int(info.get("connections")) or (len(peers) if peers else None),
@@ -558,7 +630,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     notices = [notice for notice in (info_state.warning, peers_state.warning, blockchain_state.warning) if notice]
 
     return {
-        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 3},
+        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 4},
         "dashboard": {"version": APP_VERSION},
         "generated_at": now.isoformat(),
         "node": {
@@ -585,8 +657,15 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "inbound": inbound,
             "outbound": outbound,
             "average_ping_ms": round(sum(pings) / len(pings) * 1000, 2) if pings else None,
-            "bytes_received": info.get("datareceived"),
-            "bytes_sent": info.get("datasent"),
+            "bytes_received": traffic_received,
+            "bytes_sent": traffic_sent,
+            "traffic": {
+                "received": traffic_received,
+                "sent": traffic_sent,
+                "rx_rate_bps": round(rx_rate, 2) if rx_rate is not None else None,
+                "tx_rate_bps": round(tx_rate, 2) if tx_rate is not None else None,
+                "source": traffic_source,
+            },
         },
         "ibd": {
             "session_type": session_type,
@@ -619,7 +698,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
         },
         "features": {
             "peers": bool(peers),
-            "traffic": info.get("datareceived") is not None or info.get("datasent") is not None,
+            "traffic": traffic_received is not None or traffic_sent is not None,
             "debug_log_height": log_height is not None,
             "ibd_benchmark": True,
             "host_metrics": bool(metrics.get("total_ram_bytes")),
