@@ -325,6 +325,12 @@ article {
   font-weight: 700;
 }
 .peer-details summary:hover { color: #a9c9f6; }
+.peer-state { color: #8290a4; font-weight: 600; }
+.peer-age {
+  margin-top: 6px;
+  color: #718096;
+  font-size: 12px;
+}
 .peer-table-wrap {
   margin-top: 10px;
   overflow-x: auto;

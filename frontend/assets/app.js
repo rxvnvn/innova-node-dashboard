@@ -121,8 +121,25 @@ function drawHeightGraph(canvas, history) {
   ctx.fillText(integer(minH), pad + 4, pad + gh - 2);
 }
 
-function renderPeerTable(peers) {
+function renderPeerTable(peers, meta) {
   const tbody = $('peerTableBody');
+  const stateEl = $('peerState');
+  const ageEl = $('peerAge');
+  const available = meta && meta.available === true;
+  if (!available) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8f9bae">Peer data temporarily unavailable</td></tr>';
+    stateEl.textContent = '';
+    ageEl.hidden = true;
+    return;
+  }
+  if (meta.fresh === true) {
+    stateEl.textContent = '';
+    ageEl.hidden = true;
+  } else {
+    stateEl.textContent = ' · cached';
+    ageEl.hidden = false;
+    ageEl.textContent = meta.age_seconds != null ? `Peer data: ${duration(meta.age_seconds)} old` : 'Peer data: stale';
+  }
   if (!peers || !peers.length) { tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8f9bae">No peers</td></tr>'; return; }
   const sorted = [...peers].sort((a, b) => (b.blocks_inflight || 0) - (a.blocks_inflight || 0));
   tbody.innerHTML = sorted.map(p => {
@@ -146,7 +163,9 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s; re
 function render(s) {
   const n = s.node || {}, c = s.chain || {}, w = s.network || {}, f = s.freshness || {};
   const ibd = s.ibd || {}, h = s.host || {}, hist = s.history || [];
-  const peers = ibd.peers || [];
+  const peerMeta = s.peers || {};
+  const peerAvailable = peerMeta.available === true;
+  const peers = peerAvailable ? (peerMeta.items || []) : [];
 
   badge(n.online);
   text('height', integer(c.height));
@@ -211,7 +230,7 @@ function render(s) {
   // Network section
   const agg = ibd.peer_aggregation || {};
   const tr = w.traffic || {};
-  const netVisible = agg.peer_count != null;
+  const netVisible = w.connections != null || peerAvailable || agg.peer_count != null;
   $('networkSection').hidden = !netVisible;
   if (netVisible) {
     text('netConnections', integer(w.connections));
@@ -222,8 +241,8 @@ function render(s) {
     text('netTxRate', speedHuman(tr.tx_rate_bps));
     text('netReceived', bytesHuman(tr.received ?? w.bytes_received));
     text('netSent', bytesHuman(tr.sent ?? w.bytes_sent));
-    text('peerCount', integer(agg.peer_count));
-    renderPeerTable(peers);
+    text('peerCount', integer(peerMeta.count));
+    renderPeerTable(peers, peerMeta);
   }
 
   // Height graph

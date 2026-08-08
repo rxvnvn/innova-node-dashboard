@@ -2,18 +2,36 @@
 
 ## `GET /api/v1/status`
 
-Read-only JSON status endpoint. Schema 4 adds restored traffic counters (parsed byte totals), live throughput (`network.traffic`), and per-peer version fields.
+Read-only JSON status endpoint. Schema 5 makes peer availability explicit: a
+top-level `peers` object distinguishes unavailable, cached/stale and fresh peer
+snapshots, and peer-derived metrics are `null` (not `0`) when no successful
+`getpeerinfo` result exists yet.
+
+### Zero vs unavailable vs cached
+
+The dashboard never infers zero from missing data.
+
+- **Unavailable** — no successful `getpeerinfo` result in this process
+  lifetime. `peers.available` is `false`, `peers.count` is `null`, and all
+  peer-derived metrics are `null`.
+- **Available / empty** — `getpeerinfo` succeeded and returned `[]`.
+  `peers.available` is `true`, `peers.count` is `0`. This is the only state in
+  which the UI may truthfully show "No peers".
+- **Available / cached (stale)** — a previous success exists but the latest
+  refresh failed, timed out, or aged past the polling interval. The last
+  successful items are preserved and `peers.stale` is `true`.
 
 ### Top-level sections
 
 ```json
 {
-  "api": {"name": "innova-node-dashboard", "version": "v1", "schema": 4},
-  "dashboard": {"version": "0.3.1"},
+  "api": {"name": "innova-node-dashboard", "version": "v1", "schema": 5},
+  "dashboard": {"version": "0.3.2"},
   "generated_at": "2026-07-28T12:00:00+02:00",
   "node": { ... },
   "chain": { ... },
   "network": { ... },
+  "peers": { ... },
   "ibd": { ... },
   "host": { ... },
   "history": [ ... ],
@@ -61,6 +79,45 @@ Read-only JSON status endpoint. Schema 4 adds restored traffic counters (parsed 
 **Cumulative counters.** `getinfo` returns `datareceived`/`datasent` as human-readable strings (for example `"537.48 MB"`). The backend parses them back to bytes. When `getinfo` totals are unavailable, per-peer byte counters are summed and `source` becomes `"peers"`.
 
 **Throughput.** `rx_rate_bps`/`tx_rate_bps` are derived from consecutive traffic samples (an average over the last counter update interval, normally one `getinfo` poll). No additional RPC polling is performed; the values are computed from data already being fetched.
+
+**`connections`** comes from `getinfo` and is independent of peer snapshot
+availability. `inbound`, `outbound` and `average_ping_ms` are peer-derived:
+they are `null` while no successful `getpeerinfo` result exists, and hold real
+counts (including `0` for a valid empty peer snapshot) once available.
+
+### `peers` — peer snapshot state
+
+```json
+{
+  "available": true,
+  "fresh": true,
+  "stale": false,
+  "count": 5,
+  "items": [ ... ],
+  "age_seconds": 12,
+  "last_success_at": "2026-07-28T11:59:48+02:00",
+  "last_attempt_at": "2026-07-28T12:00:00+02:00",
+  "last_error": null
+}
+```
+
+| field | type | meaning |
+| --- | --- | --- |
+| `available` | bool | `true` once a `getpeerinfo` call has ever succeeded this run |
+| `fresh` | bool | available and the last success is within the polling interval with no failures since |
+| `stale` | bool | available but the latest refresh failed, timed out, or aged past the polling interval |
+| `count` | int \| null | number of peers; `null` when unavailable (never `0` unless truly zero peers) |
+| `items` | array \| null | per-peer details; `null` when unavailable, `[]` for a valid empty snapshot |
+| `age_seconds` | int \| null | seconds since the last successful fetch |
+| `last_success_at` | ISO \| null | when the last successful result was stored |
+| `last_attempt_at` | ISO \| null | when the last fetch attempt ran |
+| `last_error` | string \| null | most recent failure reason |
+
+When `available` is `false`, `count` and `items` are `null` — never `[]`/`0`.
+
+The peer cache is invalidated (returns to `unavailable`) when the `innovad`
+process restarts, so stale connections from a previous daemon instance are not
+reported as authoritative.
 
 ### `ibd` — IBD benchmark
 
@@ -112,6 +169,11 @@ Read-only JSON status endpoint. Schema 4 adds restored traffic counters (parsed 
 **`peers`** — array of per-peer details with `addr`, `version` (user agent, e.g. `/innova:5.0.1/`), `protocol_version`, `starting_height`, `best_known_height`, `blocks_inflight`, `ask_queue`, `bytes_received`, `bytes_sent`, `pingtime`.
 
 The daemon reports per-peer sent bytes as `bytessend` (not `bytessent`); the backend reads the correct field. `best_known_height` is the peer-reported chain tip and is shown under Start height when the daemon does not expose a starting height.
+
+**`peer_aggregation`** mirrors the `peers` object: `peer_count` and the derived
+counters are `null` while the peer snapshot is unavailable and hold their real
+values (including zeros) once available. `ibd.peers` is likewise `null` when
+unavailable, never `[]` by default.
 
 ### `host` — host metrics
 

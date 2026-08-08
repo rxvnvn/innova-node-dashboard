@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 API_VERSION = "v1"
 HEIGHT_RE = re.compile(rb"SetBestChain:.*?\bheight=(\d+)\b")
 
@@ -51,10 +51,18 @@ class Config:
 
 
 class TimedValue:
+    """Cached value with explicit availability and freshness lifecycle.
+
+    ``value`` starts as ``None`` meaning "never fetched" (UNAVAILABLE). A
+    successful fetch stores the real result (which may be a valid empty list)
+    and a failure preserves the last successful value while marking it stale.
+    """
+
     def __init__(self) -> None:
         self.value: Any = None
         self.updated_wall: dt.datetime | None = None
         self.last_attempt = 0.0
+        self.last_attempt_wall: dt.datetime | None = None
         self.failures = 0
         self.warning: str | None = None
 
@@ -66,13 +74,24 @@ class TimedValue:
         self.value = value
         self.updated_wall = dt.datetime.now().astimezone()
         self.last_attempt = time.monotonic()
+        self.last_attempt_wall = dt.datetime.now().astimezone()
         self.failures = 0
         self.warning = None
 
     def failure(self, warning: str) -> None:
         self.last_attempt = time.monotonic()
+        self.last_attempt_wall = dt.datetime.now().astimezone()
         self.failures += 1
         self.warning = warning
+
+    def invalidate(self, warning: str) -> None:
+        """Drop the cached value (e.g. after the daemon restarted)."""
+        self.value = None
+        self.updated_wall = None
+        self.failures = 0
+        self.warning = warning
+        self.last_attempt = 0.0
+        self.last_attempt_wall = dt.datetime.now().astimezone()
 
     def age_seconds(self) -> int | None:
         if self.updated_wall is None:
@@ -307,6 +326,49 @@ def aggregate_peers(peers: list[dict]) -> dict[str, Any]:
     }
 
 
+def peer_snapshot_state(state: TimedValue, interval: int) -> dict[str, Any]:
+    """Describe the peer snapshot lifecycle.
+
+    availability / freshness / value are independent axes:
+
+    - UNAVAILABLE: ``value`` is None (never successfully fetched this run)
+    - AVAILABLE:   ``value`` is a list, including a valid empty list
+    - FRESH:       last success within the polling interval and no failures
+                   since it
+    - STALE:       a previous success exists but the latest refresh failed,
+                   timed out, or aged beyond the polling interval
+
+    A successful ``[]`` is AVAILABLE with ``count == 0``; it is never inferred
+    from missing data.
+    """
+    available = isinstance(state.value, list)
+    if not available:
+        return {
+            "available": False,
+            "fresh": False,
+            "stale": False,
+            "count": None,
+            "items": None,
+            "age_seconds": None,
+            "last_success_at": None,
+            "last_attempt_at": iso(state.last_attempt_wall),
+            "last_error": state.warning,
+        }
+    age = state.age_seconds()
+    fresh = state.failures == 0 and age is not None and age <= interval
+    return {
+        "available": True,
+        "fresh": fresh,
+        "stale": not fresh,
+        "count": len(state.value),
+        "items": aggregate_peers(state.value)["details"],
+        "age_seconds": age,
+        "last_success_at": iso(state.updated_wall),
+        "last_attempt_at": iso(state.last_attempt_wall),
+        "last_error": state.warning,
+    }
+
+
 def host_metrics() -> dict[str, Any]:
     cpu_count = os.cpu_count()
     total_ram_bytes = None
@@ -338,6 +400,7 @@ class Collector:
         self.traffic = TrafficTracker()
         self.metrics = host_metrics()
         self._last_sample_time = 0.0
+        self._observed_pid: int | None = None
 
     def rpc_json(self, method: str) -> tuple[Any | None, str | None]:
         code, output, error = rpc(self.config, [method])
@@ -347,6 +410,19 @@ class Collector:
             return json.loads(output), None
         except json.JSONDecodeError:
             return None, f"{method} returned invalid JSON"
+
+    def check_daemon_restart(self, pid: int | None) -> None:
+        """Drop the peer cache when the innovad process restarts.
+
+        Connections from a previous daemon instance no longer exist; their
+        cached peer snapshot would otherwise be reported as authoritative for
+        up to the polling/backoff window. The peer cache becomes UNAVAILABLE
+        and is re-fetched on the next scheduled attempt.
+        """
+        if pid is not None:
+            if self._observed_pid is not None and pid != self._observed_pid:
+                self.peers.invalidate("innovad process restarted (PID changed)")
+            self._observed_pid = pid
 
     def refresh_rpc(self) -> None:
         if self.info.due(self.config.info_interval, self.config.max_backoff):
@@ -372,9 +448,12 @@ class Collector:
 
     def collect(self) -> dict[str, Any]:
         with self.lock:
+            pid = process_pid(self.config)
+            self.check_daemon_restart(pid)
             self.refresh_rpc()
             snapshot = build_snapshot(self.config, self.info, self.peers, self.blockchain,
-                                     self.ibd_tracker, self.sampler, self.metrics, self.traffic)
+                                      self.ibd_tracker, self.sampler, self.metrics, self.traffic,
+                                      daemon_pid=pid)
             now_mono = time.time()
             if now_mono - self._last_sample_time >= SAMPLE_INTERVAL:
                 chain = snapshot.get("chain", {})
@@ -555,10 +634,11 @@ def iso(value: dt.datetime | None) -> str | None:
 def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedValue,
                    blockchain_state: TimedValue, ibd_tracker: IBDTracker,
                    sampler: IBDSampler, metrics: dict[str, Any],
-                   traffic: TrafficTracker | None = None) -> dict[str, Any]:
+                   traffic: TrafficTracker | None = None,
+                   daemon_pid: int | None = None) -> dict[str, Any]:
     now = dt.datetime.now().astimezone()
     info = info_state.value if isinstance(info_state.value, dict) else {}
-    peers = peers_state.value if isinstance(peers_state.value, list) else []
+    peers = peers_state.value if isinstance(peers_state.value, list) else None
     blockchain = blockchain_state.value if isinstance(blockchain_state.value, dict) else {}
 
     log_height, log_updated = read_log_height(config.debug_log, config.log_tail_bytes)
@@ -568,12 +648,12 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
 
     ibd_rpc = blockchain.get("initialblockdownload") if isinstance(blockchain.get("initialblockdownload"), bool) else info.get("initialblockdownload")
 
-    pid = process_pid(config)
+    pid = daemon_pid if daemon_pid is not None else process_pid(config)
     started_at, uptime_seconds = process_times(pid, config)
-    inbound = sum(1 for peer in peers if peer.get("inbound") is True) if peers else None
-    outbound = sum(1 for peer in peers if peer.get("inbound") is False) if peers else None
-    pings = [as_float(peer.get("pingtime")) for peer in peers]
-    pings = [ping for ping in pings if ping is not None]
+    inbound = sum(1 for peer in peers if peer.get("inbound") is True) if peers is not None else None
+    outbound = sum(1 for peer in peers if peer.get("inbound") is False) if peers is not None else None
+    pings = [as_float(peer.get("pingtime")) for peer in peers] if peers is not None else None
+    pings = [ping for ping in pings if ping is not None] if pings else None
 
     rpc_ok = info_state.failures == 0 or peers_state.failures == 0
     rpc_failures = max(info_state.failures, peers_state.failures)
@@ -582,17 +662,26 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     current_rate = sampler.current_rate()
     ibd_tracker.update_ema(current_rate)
 
-    peer_agg = aggregate_peers(peers)
-    estimated_tip = estimate_network_height(peers, height)
+    if peers is None:
+        peer_agg = {
+            "active_download_peers": None,
+            "total_blocks_inflight": None,
+            "total_ask_queue": None,
+            "details": None,
+        }
+    else:
+        peer_agg = aggregate_peers(peers)
+    peer_snap = peer_snapshot_state(peers_state, config.peer_interval)
+    estimated_tip = estimate_network_height(peers, height) if peers is not None else None
 
     traffic_received = parse_bytes(info.get("datareceived"))
     traffic_sent = parse_bytes(info.get("datasent"))
     traffic_source = "getinfo"
     if traffic_received is None and peers:
-        traffic_received = sum(p["bytes_received"] or 0 for p in peer_agg["details"])
+        traffic_received = sum(p["bytes_received"] or 0 for p in (peer_agg["details"] or []))
         traffic_source = "peers"
     if traffic_sent is None and peers:
-        traffic_sent = sum(p["bytes_sent"] or 0 for p in peer_agg["details"])
+        traffic_sent = sum(p["bytes_sent"] or 0 for p in (peer_agg["details"] or []))
         traffic_source = "peers"
     if traffic_received is None and traffic_sent is None:
         traffic_source = None
@@ -601,7 +690,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     rx_rate, tx_rate = traffic.rates() if traffic is not None else (None, None)
 
     ibd_tracker.update_peaks(
-        as_int(info.get("connections")) or (len(peers) if peers else None),
+        as_int(info.get("connections")) or (len(peers) if isinstance(peers, list) and peers else None),
         peer_agg["total_blocks_inflight"],
         peer_agg["total_ask_queue"],
     )
@@ -630,7 +719,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     notices = [notice for notice in (info_state.warning, peers_state.warning, blockchain_state.warning) if notice]
 
     return {
-        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 4},
+        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 5},
         "dashboard": {"version": APP_VERSION},
         "generated_at": now.isoformat(),
         "node": {
@@ -653,7 +742,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "verification_progress": as_float(blockchain.get("verificationprogress")),
         },
         "network": {
-            "connections": as_int(info.get("connections")) if info.get("connections") is not None else (len(peers) if peers else None),
+            "connections": as_int(info.get("connections")) if info.get("connections") is not None else (len(peers) if isinstance(peers, list) and peers else None),
             "inbound": inbound,
             "outbound": outbound,
             "average_ping_ms": round(sum(pings) / len(pings) * 1000, 2) if pings else None,
@@ -667,6 +756,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
                 "source": traffic_source,
             },
         },
+        "peers": peer_snap,
         "ibd": {
             "session_type": session_type,
             "session_start_height": session_start,
@@ -682,7 +772,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
                 "active_download_peers": peer_agg["active_download_peers"],
                 "total_blocks_inflight": peer_agg["total_blocks_inflight"],
                 "total_ask_queue": peer_agg["total_ask_queue"],
-                "peer_count": len(peers),
+                "peer_count": len(peers) if isinstance(peers, list) else None,
             },
             "peers": peer_agg["details"],
         },
@@ -697,7 +787,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "getblockchaininfo_failures": blockchain_state.failures,
         },
         "features": {
-            "peers": bool(peers),
+            "peers": peers is not None,
             "traffic": traffic_received is not None or traffic_sent is not None,
             "debug_log_height": log_height is not None,
             "ibd_benchmark": True,

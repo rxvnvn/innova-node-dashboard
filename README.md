@@ -73,10 +73,11 @@ curl http://127.0.0.1:8787/health
 ## Tests
 
 ```bash
-python3 -m unittest tests.test_ibd_logic -v
+python3 -m unittest discover -s tests -p "test_*.py" -v
+node tests/test_frontend_render.js
 ```
 
-Tests cover: blocks/min rate calculation, zero growth, negative delta after restart, 5-minute sliding average, session average, ETA, zero-rate ETA suppression, peer aggregation, estimated tip with outliers, sync state classification, bounded sample history, and restart session detection.
+Backend tests cover: blocks/min rate calculation, zero growth, negative delta after restart, 5-minute sliding average, session average, ETA, zero-rate ETA suppression, peer aggregation, estimated tip with outliers, sync state classification, bounded sample history, restart session detection, and the peer snapshot lifecycle (unavailable / fresh / cached / zero-peer). The Node script checks the rendered UI states for unknown, zero, fresh and stale peer data.
 
 ## Install
 
@@ -112,6 +113,31 @@ The dashboard is read-only and does not expose arbitrary RPC execution or creden
 ## Future innovad integration
 
 Serve the same static frontend and implement `GET /api/v1/status` in the daemon according to `docs/API.md`. The frontend contains no Python-specific code.
+
+## Version 0.3.2
+
+Peer snapshot correctness — the dashboard no longer conflates "peer data not
+yet available" with "the node has zero peers":
+
+- **Explicit peer state** — the API now exposes a top-level `peers` object with
+  `available` / `fresh` / `stale`, `count`, `items`, age and last-attempt/error
+  metadata (schema 5).
+- **Zero vs unavailable** — a successful `getpeerinfo` returning `[]` is the
+  only state that reports a true zero. Until the first successful call, `count`
+  and peer-derived metrics are `null`, never `0`.
+- **Cached data survives RPC failures** — a timed-out or failed refresh keeps
+  the last successful peer snapshot and marks it `stale`, with a visible
+  `cached` indicator and age in the UI.
+- **Peer-derived metrics** — inbound, outbound, average ping, active download
+  peers, blocks in flight and queued requests render as `—` (unknown) instead
+  of a false `0`. Connections still come from `getinfo` and remain available.
+- **Startup behavior** — `getpeerinfo` is already attempted immediately on the
+  first status poll (the scheduler's first tick), then returns to the
+  120-second steady-state cadence with exponential backoff; no extra RPC
+  pressure is added.
+- **Daemon restart** — when `innovad` restarts (PID change), the peer cache is
+  invalidated so connections from the previous daemon instance are not reported
+  as authoritative.
 
 ## Version 0.3.1
 
