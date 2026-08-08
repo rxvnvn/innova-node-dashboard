@@ -77,7 +77,7 @@ python3 -m unittest discover -s tests -p "test_*.py" -v
 node tests/test_frontend_render.js
 ```
 
-Backend tests cover: blocks/min rate calculation, zero growth, negative delta after restart, 5-minute sliding average, session average, ETA, zero-rate ETA suppression, peer aggregation, estimated tip with outliers, sync state classification, bounded sample history, restart session detection, and the peer snapshot lifecycle (unavailable / fresh / cached / zero-peer). The Node script checks the rendered UI states for unknown, zero, fresh and stale peer data.
+Backend tests cover: blocks/min rate calculation, zero growth, negative delta after restart, 5-minute sliding average, session average, ETA, zero-rate ETA suppression, peer aggregation, estimated tip with outliers, sync state classification, bounded sample history, restart session detection, the peer snapshot lifecycle (unavailable / fresh / cached / zero-peer), and the daemon lifecycle (stop confirmation, cache invalidation, last-known height). The Node script checks the rendered UI states for unknown, zero, fresh and stale peer data, the offline badge and last-known height, and the release version link.
 
 ## Install
 
@@ -113,6 +113,34 @@ The dashboard is read-only and does not expose arbitrary RPC execution or creden
 ## Future innovad integration
 
 Serve the same static frontend and implement `GET /api/v1/status` in the daemon according to `docs/API.md`. The frontend contains no Python-specific code.
+
+## Version 0.3.3
+
+Daemon lifecycle correctness — the dashboard now distinguishes a live node from
+historical monitoring data:
+
+- **Confirmed lifecycle state** — `node.online` is tri-state: `true` (running),
+  `false` (confirmed stopped), `null` (unknown / not yet observed).
+- **2-miss shutdown confirmation** — a single PID-detection miss is a transient
+  lookup failure; two consecutive misses while the node was running confirm
+  shutdown. Temporary RPC failures never change lifecycle state and keep the
+  last peer snapshot (marked `cached`).
+- **Stopped daemon is not live** — cached height no longer keeps a stopped node
+  "online". While stopped, live height, connections, peer-derived totals and
+  traffic rates are suppressed.
+- **Last known height** — `chain.last_known_height` preserves the last observed
+  live height as historical information ("Last known height: 6 812 442"), shown
+  only when offline and never affecting `node.online`.
+- **Clean restart** — when the daemon restarts (PID change), daemon-specific
+  caches and traffic samples are invalidated so old data is never presented as
+  current; live state repopulates from the next polls.
+- **Version release link** — the footer version links to the matching GitHub
+  Release (`…/releases/tag/v<version>`), built dynamically from the API
+  version, opened in a new tab.
+- **Offline badge** — a confirmed stopped daemon shows "Offline"; unknown shows
+  "Checking".
+- API schema bumped to 6 for the new `chain.last_known_height` field and
+  tri-state `node.online`.
 
 ## Version 0.3.2
 

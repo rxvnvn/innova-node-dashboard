@@ -14,6 +14,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 from server import (
+    DAEMON_RUNNING,
+    DAEMON_STOPPED,
+    Collector,
+    DaemonState,
     IBDSampler,
     IBDTracker,
     TimedValue,
@@ -26,6 +30,10 @@ from server import (
     estimate_network_height,
     parse_bytes,
 )
+
+
+def _running_daemon() -> DaemonState:
+    return DaemonState(state=DAEMON_RUNNING, pid=123)
 
 
 class TestParseBytes(unittest.TestCase):
@@ -566,7 +574,7 @@ class TestBuildSnapshotNoCrash(unittest.TestCase):
         tracker.update(100, now=now - 60)
         tracker.update(200, now=now)
 
-        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, daemon=_running_daemon())
         self.assertIsInstance(snap, dict)
         self.assertIn("ibd", snap)
         self.assertIsNotNone(snap["ibd"]["last_height_advance_ago_seconds"])
@@ -593,6 +601,123 @@ class TestBuildSnapshotNoCrash(unittest.TestCase):
 
     @patch("server.process_times", return_value=(None, None))
     @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_stopped_daemon_suppresses_live_data(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 500, "connections": 12, "datareceived": 1024, "datasent": 2048})
+        peers = TimedValue()
+        peers.success([{"inbound": True, "pingtime": 0.05}])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": False})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        stopped = DaemonState(state=DAEMON_STOPPED)
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, daemon=stopped)
+        self.assertIs(snap["node"]["online"], False)
+        self.assertIsNone(snap["chain"]["height"])
+        self.assertIsNone(snap["chain"]["height_source"])
+        self.assertIsNone(snap["network"]["connections"])
+        self.assertIsNone(snap["network"]["bytes_received"])
+        self.assertIsNone(snap["network"]["traffic"]["rx_rate_bps"])
+        self.assertIsNone(snap["node"]["started_at"])
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_unknown_daemon_is_undetermined_not_offline(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 500, "connections": 12})
+        peers = TimedValue()
+        peers.success([])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": False})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        self.assertIsNone(snap["node"]["online"])
+        self.assertIsNone(snap["chain"]["height"])
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_last_known_height_survives_stop(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 500, "connections": 12})
+        peers = TimedValue()
+        peers.success([])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": False})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        running = _running_daemon()
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={},
+                              daemon=running, last_known_height=500)
+        self.assertEqual(snap["chain"]["height"], 500)
+        self.assertEqual(snap["chain"]["last_known_height"], 500)
+        self.assertIs(snap["node"]["online"], True)
+
+        stopped = DaemonState(state=DAEMON_STOPPED)
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={},
+                              daemon=stopped, last_known_height=500)
+        self.assertIs(snap["node"]["online"], False)
+        self.assertIsNone(snap["chain"]["height"])
+        self.assertEqual(snap["chain"]["last_known_height"], 500)
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_build_snapshot_stopped_daemon_forces_peers_stale(self, _pid, _times):
+        config = _make_config()
+        info = TimedValue()
+        info.success({"blocks": 500, "connections": 12})
+        peers = TimedValue()
+        peers.success([{"inbound": True, "pingtime": 0.05}])
+        blockchain = TimedValue()
+        blockchain.success({"initialblockdownload": False})
+        tracker = IBDTracker()
+        sampler = IBDSampler()
+
+        stopped = DaemonState(state=DAEMON_STOPPED)
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, daemon=stopped)
+        self.assertTrue(snap["peers"]["available"])
+        self.assertFalse(snap["peers"]["fresh"])
+        self.assertTrue(snap["peers"]["stale"])
+        self.assertEqual(snap["peers"]["count"], 1)
+
+    def test_collector_tracks_last_known_height_across_stop(self):
+        config = _make_config()
+        col = Collector(config)
+
+        def rpc(method):
+            if method == "getinfo":
+                return {"blocks": 500, "connections": 2}, None
+            if method == "getblockchaininfo":
+                return {"initialblockdownload": False}, None
+            return None, "RPC busy"
+
+        with patch.object(col, "rpc_json", side_effect=rpc), \
+             patch("server.process_pid", return_value=999):
+            snap = col.collect()
+        self.assertEqual(snap["chain"]["height"], 500)
+        self.assertIsNone(snap["chain"]["last_known_height"])
+        self.assertEqual(col._last_known_height, 500)
+
+        with patch.object(col, "rpc_json", side_effect=rpc), \
+             patch("server.process_pid", return_value=None):
+            snap = col.collect()
+        self.assertIs(snap["node"]["online"], True)
+
+        with patch.object(col, "rpc_json", side_effect=rpc), \
+             patch("server.process_pid", return_value=None):
+            snap = col.collect()
+        self.assertIs(snap["node"]["online"], False)
+        self.assertIsNone(snap["chain"]["height"])
+        self.assertEqual(snap["chain"]["last_known_height"], 500)
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
     def test_build_snapshot_traffic_string_getinfo(self, _pid, _times):
         config = _make_config()
         info = TimedValue()
@@ -605,7 +730,7 @@ class TestBuildSnapshotNoCrash(unittest.TestCase):
         sampler = IBDSampler()
         traffic = TrafficTracker()
 
-        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, traffic=traffic)
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, traffic=traffic, daemon=_running_daemon())
         net = snap["network"]
         self.assertEqual(net["bytes_received"], int(round(537.48 * 1024 ** 2)))
         self.assertEqual(net["bytes_sent"], int(round(80.02 * 1024 ** 2)))
@@ -628,7 +753,7 @@ class TestBuildSnapshotNoCrash(unittest.TestCase):
         tracker = IBDTracker()
         sampler = IBDSampler()
 
-        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, daemon=_running_daemon())
         net = snap["network"]
         self.assertEqual(net["bytes_received"], 5120)
         self.assertEqual(net["bytes_sent"], 2304)
@@ -667,12 +792,12 @@ class TestBuildSnapshotNoCrash(unittest.TestCase):
         sampler = IBDSampler()
         traffic = TrafficTracker()
 
-        build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, traffic=traffic)
+        build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, traffic=traffic, daemon=_running_daemon())
         info2 = TimedValue()
         info2.success({"blocks": 500, "connections": 3, "datareceived": 6000, "datasent": 0})
         now = time.time()
         traffic.samples[-1] = (now, 0, 0)
-        snap = build_snapshot(config, info2, peers, blockchain, tracker, sampler, metrics={}, traffic=traffic)
+        snap = build_snapshot(config, info2, peers, blockchain, tracker, sampler, metrics={}, traffic=traffic, daemon=_running_daemon())
         rate = snap["network"]["traffic"]["rx_rate_bps"]
         self.assertIsNotNone(rate)
         self.assertGreater(rate, 0)
@@ -693,7 +818,7 @@ class TestBuildSnapshotNoCrash(unittest.TestCase):
         tracker = IBDTracker()
         sampler = IBDSampler()
 
-        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={})
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={}, daemon=_running_daemon())
         net = snap["network"]
         self.assertEqual(net["connections"], 12)
         self.assertEqual(net["inbound"], 1)
@@ -758,7 +883,7 @@ class TestJSONEndpointPayload(unittest.TestCase):
         tracker.update(900, now=now - 120)
         tracker.update(1000, now=now)
 
-        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={"cpu_count": 2})
+        snap = build_snapshot(config, info, peers, blockchain, tracker, sampler, metrics={"cpu_count": 2}, daemon=_running_daemon())
         payload = json.dumps(snap, ensure_ascii=False, separators=(",", ":")).encode()
         parsed = json.loads(payload)
         self.assertEqual(parsed["chain"]["height"], 1000)

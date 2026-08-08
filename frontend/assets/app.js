@@ -62,7 +62,25 @@ function relativeAgo(iso) {
 }
 function badge(online) {
   $('badge').className = 'badge ' + (online === true ? 'online' : online === false ? 'offline' : 'unknown');
-  text('status', online === true ? 'Online' : online === false ? 'No data' : 'Checking');
+  text('status', online === true ? 'Online' : online === false ? 'Offline' : 'Checking');
+}
+function releaseVersionUrl(version) {
+  if (version === null || version === undefined) return null;
+  const v = String(version).trim();
+  if (!/^\d+\.\d+\.\d+$/.test(v)) return null;
+  return `https://github.com/rxvnvn/innova-node-dashboard/releases/tag/v${v}`;
+}
+function renderReleaseVersion(el, version) {
+  while (el.firstChild) el.removeChild(el.firstChild);
+  const v = version === null || version === undefined || version === '' ? '—' : String(version);
+  const url = releaseVersionUrl(version);
+  if (url === null) { el.textContent = v; return; }
+  const a = document.createElement('a');
+  a.textContent = v;
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  el.appendChild(a);
 }
 function sourceLabel(source) {
   return source === 'debug_log' ? 'Live · Debug log' : source === 'rpc' ? 'Live · RPC' : 'Source unknown';
@@ -170,6 +188,14 @@ function render(s) {
   badge(n.online);
   text('height', integer(c.height));
   text('heightSource', sourceLabel(c.height_source));
+  const lastKnown = $('lastKnownHeight');
+  if (n.online === true || c.last_known_height == null) {
+    lastKnown.hidden = true;
+    lastKnown.textContent = '';
+  } else {
+    lastKnown.hidden = false;
+    lastKnown.textContent = 'Last known height: ' + integer(c.last_known_height);
+  }
   text('started', date(n.started_at));
   text('uptime', duration(n.uptime_seconds));
   text('connections', integer(w.connections));
@@ -185,7 +211,7 @@ function render(s) {
   text('version', n.version);
   text('build', n.build_commit);
   text('api', s.api?.version);
-  text('dashVersion', s.dashboard?.version);
+  renderReleaseVersion($('dashVersion'), s.dashboard?.version);
 
   text('ibd', c.initial_block_download === true ? 'IBD — synchronization in progress' : c.initial_block_download === false ? 'Synchronization complete' : c.height != null ? 'Node active · RPC sync state cached' : 'Sync status unknown');
   text('updated', relativeAgo(s.generated_at));

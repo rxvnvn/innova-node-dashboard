@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 API_VERSION = "v1"
 HEIGHT_RE = re.compile(rb"SetBestChain:.*?\bheight=(\d+)\b")
 
@@ -29,6 +29,11 @@ STALE_HEALTHY_S = 60
 STALE_SLOW_S = 180
 EMA_ALPHA = 0.15
 MIN_PEERS_FOR_ETA = 3
+
+STOP_CONFIRM_MISSES = 2
+DAEMON_RUNNING = "running"
+DAEMON_STOPPED = "stopped"
+DAEMON_UNKNOWN = "unknown"
 
 BYTE_UNITS = {"": 1, "B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
 
@@ -48,6 +53,19 @@ class Config:
     conf: str | None
     debug_log: Path | None
     frontend: Path
+
+
+@dataclass(frozen=True)
+class DaemonState:
+    """Confirmed daemon lifecycle state as of the current snapshot.
+
+    - running:  a live process with a matching PID was observed
+    - stopped:  a previously running daemon was confirmed absent
+    - unknown:  no running process has ever been observed this run
+    """
+
+    state: str = DAEMON_UNKNOWN
+    pid: int | None = None
 
 
 class TimedValue:
@@ -213,7 +231,7 @@ class IBDTracker:
             self.last_height_change = now
             return
         if height != self.last_height:
-            if height > self.last_height:
+            if self.last_height is not None and height > self.last_height:
                 self._last_advance_time = now
             self.last_height = height
             self.last_height_change = now
@@ -401,6 +419,9 @@ class Collector:
         self.metrics = host_metrics()
         self._last_sample_time = 0.0
         self._observed_pid: int | None = None
+        self._daemon_state: str = DAEMON_UNKNOWN
+        self._stop_misses = 0
+        self._last_known_height: int | None = None
 
     def rpc_json(self, method: str) -> tuple[Any | None, str | None]:
         code, output, error = rpc(self.config, [method])
@@ -411,18 +432,39 @@ class Collector:
         except json.JSONDecodeError:
             return None, f"{method} returned invalid JSON"
 
-    def check_daemon_restart(self, pid: int | None) -> None:
-        """Drop the peer cache when the innovad process restarts.
+    def invalidate_daemon_caches(self, warning: str) -> None:
+        """Drop daemon-specific cached state after a restart/stop transition."""
+        for state in (self.info, self.peers, self.blockchain):
+            state.invalidate(warning)
+        self.traffic.samples.clear()
+        self._last_sample_time = 0.0
 
-        Connections from a previous daemon instance no longer exist; their
-        cached peer snapshot would otherwise be reported as authoritative for
-        up to the polling/backoff window. The peer cache becomes UNAVAILABLE
-        and is re-fetched on the next scheduled attempt.
+    def update_daemon_state(self, pid: int | None) -> DaemonState:
+        """Advance the daemon lifecycle state machine.
+
+        - a found PID confirms RUNNING; a PID change or reappearance after a
+          confirmed stop invalidates daemon-specific caches so old data from a
+          previous instance is never presented as current
+        - STOPPED requires ``STOP_CONFIRM_MISSES`` consecutive PID-detection
+          misses while previously RUNNING, so one transient lookup failure
+          never triggers a false shutdown
+        - UNKNOWN while no running process has ever been observed this run
         """
         if pid is not None:
-            if self._observed_pid is not None and pid != self._observed_pid:
-                self.peers.invalidate("innovad process restarted (PID changed)")
+            restarted = self._observed_pid is not None and pid != self._observed_pid
+            if restarted or self._daemon_state == DAEMON_STOPPED:
+                self.invalidate_daemon_caches("innovad process restarted (PID changed)")
             self._observed_pid = pid
+            self._daemon_state = DAEMON_RUNNING
+            self._stop_misses = 0
+        else:
+            self._stop_misses += 1
+            if self._daemon_state == DAEMON_RUNNING and self._stop_misses >= STOP_CONFIRM_MISSES:
+                self._daemon_state = DAEMON_STOPPED
+                self._observed_pid = None
+                self._stop_misses = 0
+        effective_pid = self._observed_pid if self._daemon_state == DAEMON_RUNNING else None
+        return DaemonState(state=self._daemon_state, pid=effective_pid)
 
     def refresh_rpc(self) -> None:
         if self.info.due(self.config.info_interval, self.config.max_backoff):
@@ -449,13 +491,16 @@ class Collector:
     def collect(self) -> dict[str, Any]:
         with self.lock:
             pid = process_pid(self.config)
-            self.check_daemon_restart(pid)
+            daemon = self.update_daemon_state(pid)
             self.refresh_rpc()
             snapshot = build_snapshot(self.config, self.info, self.peers, self.blockchain,
                                       self.ibd_tracker, self.sampler, self.metrics, self.traffic,
-                                      daemon_pid=pid)
+                                      daemon=daemon, last_known_height=self._last_known_height)
+            live_height = snapshot.get("chain", {}).get("height")
+            if live_height is not None:
+                self._last_known_height = live_height
             now_mono = time.time()
-            if now_mono - self._last_sample_time >= SAMPLE_INTERVAL:
+            if daemon.state == DAEMON_RUNNING and now_mono - self._last_sample_time >= SAMPLE_INTERVAL:
                 chain = snapshot.get("chain", {})
                 net = snapshot.get("network", {})
                 ibd_sec = snapshot.get("ibd", {})
@@ -635,20 +680,28 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
                    blockchain_state: TimedValue, ibd_tracker: IBDTracker,
                    sampler: IBDSampler, metrics: dict[str, Any],
                    traffic: TrafficTracker | None = None,
-                   daemon_pid: int | None = None) -> dict[str, Any]:
+                   daemon: DaemonState | None = None,
+                   last_known_height: int | None = None) -> dict[str, Any]:
     now = dt.datetime.now().astimezone()
     info = info_state.value if isinstance(info_state.value, dict) else {}
     peers = peers_state.value if isinstance(peers_state.value, list) else None
     blockchain = blockchain_state.value if isinstance(blockchain_state.value, dict) else {}
 
+    daemon = daemon or DaemonState()
+    running = daemon.state == DAEMON_RUNNING
+    online = True if running else (False if daemon.state == DAEMON_STOPPED else None)
+
     log_height, log_updated = read_log_height(config.debug_log, config.log_tail_bytes)
     rpc_height = as_int(info.get("blocks"))
     height = log_height if log_height is not None else rpc_height
     height_source = "debug_log" if log_height is not None else ("rpc" if rpc_height is not None else None)
+    if not running:
+        height = None
+        height_source = None
 
     ibd_rpc = blockchain.get("initialblockdownload") if isinstance(blockchain.get("initialblockdownload"), bool) else info.get("initialblockdownload")
 
-    pid = daemon_pid if daemon_pid is not None else process_pid(config)
+    pid = daemon.pid if running else None
     started_at, uptime_seconds = process_times(pid, config)
     inbound = sum(1 for peer in peers if peer.get("inbound") is True) if peers is not None else None
     outbound = sum(1 for peer in peers if peer.get("inbound") is False) if peers is not None else None
@@ -672,6 +725,8 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     else:
         peer_agg = aggregate_peers(peers)
     peer_snap = peer_snapshot_state(peers_state, config.peer_interval)
+    if not running and peer_snap.get("available"):
+        peer_snap = dict(peer_snap, fresh=False, stale=True)
     estimated_tip = estimate_network_height(peers, height) if peers is not None else None
 
     traffic_received = parse_bytes(info.get("datareceived"))
@@ -685,9 +740,16 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
         traffic_source = "peers"
     if traffic_received is None and traffic_sent is None:
         traffic_source = None
-    if traffic is not None:
-        traffic.record(traffic_received, traffic_sent)
-    rx_rate, tx_rate = traffic.rates() if traffic is not None else (None, None)
+    if not running:
+        traffic_received = None
+        traffic_sent = None
+        traffic_source = None
+        rx_rate = None
+        tx_rate = None
+    else:
+        if traffic is not None:
+            traffic.record(traffic_received, traffic_sent)
+        rx_rate, tx_rate = traffic.rates() if traffic is not None else (None, None)
 
     ibd_tracker.update_peaks(
         as_int(info.get("connections")) or (len(peers) if isinstance(peers, list) and peers else None),
@@ -719,11 +781,11 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     notices = [notice for notice in (info_state.warning, peers_state.warning, blockchain_state.warning) if notice]
 
     return {
-        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 5},
+        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 6},
         "dashboard": {"version": APP_VERSION},
         "generated_at": now.isoformat(),
         "node": {
-            "online": pid is not None or height is not None,
+            "online": online,
             "network": "mainnet",
             "version": info.get("version"),
             "build_commit": info.get("buildcommit"),
@@ -736,16 +798,17 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "height": height,
             "height_source": height_source,
             "height_updated_at": iso(log_updated if height_source == "debug_log" else info_state.updated_wall),
+            "last_known_height": last_known_height,
             "initial_block_download": ibd_rpc,
             "difficulty": info.get("difficulty"),
             "money_supply": info.get("moneysupply"),
             "verification_progress": as_float(blockchain.get("verificationprogress")),
         },
         "network": {
-            "connections": as_int(info.get("connections")) if info.get("connections") is not None else (len(peers) if isinstance(peers, list) and peers else None),
-            "inbound": inbound,
-            "outbound": outbound,
-            "average_ping_ms": round(sum(pings) / len(pings) * 1000, 2) if pings else None,
+            "connections": (as_int(info.get("connections")) if info.get("connections") is not None else (len(peers) if isinstance(peers, list) and peers else None)) if running else None,
+            "inbound": inbound if running else None,
+            "outbound": outbound if running else None,
+            "average_ping_ms": round(sum(pings) / len(pings) * 1000, 2) if pings and running else None,
             "bytes_received": traffic_received,
             "bytes_sent": traffic_sent,
             "traffic": {
@@ -809,8 +872,8 @@ class Server(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server_version = f"InnovaDashboard/{APP_VERSION}"
 
-    def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"{self.address_string()} - {fmt % args}")
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"{self.address_string()} - {format % args}")
 
     @property
     def app(self) -> Server:

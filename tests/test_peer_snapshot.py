@@ -12,6 +12,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 from server import (
+    DAEMON_RUNNING,
+    DAEMON_STOPPED,
+    DaemonState,
     IBDTracker,
     IBDSampler,
     Collector,
@@ -42,11 +45,12 @@ def _snap(info=None, peers=None, bc=None):
         blockchain.success(bc)
     tracker = IBDTracker()
     sampler = IBDSampler()
+    daemon = DaemonState(state=DAEMON_RUNNING, pid=123)
     with patch("server.process_times", return_value=(None, None)), \
          patch("server.process_pid", return_value=None), \
          patch("server.read_log_height", return_value=(None, None)):
         return build_snapshot(config, info_state, peers_state, blockchain,
-                              tracker, sampler, metrics={"cpu_count": 2})
+                              tracker, sampler, metrics={"cpu_count": 2}, daemon=daemon)
 
 
 def _peer_timed(value, failures=0, age_seconds=0):
@@ -253,23 +257,56 @@ class TestCollectorDaemonRestart(unittest.TestCase):
         collector = Collector(_make_config())
         collector.peers.success([{"addr": "a"}])
         collector._observed_pid = 100
-        collector.check_daemon_restart(200)
+        collector.update_daemon_state(200)
         self.assertIsNone(collector.peers.value)
         self.assertEqual(collector._observed_pid, 200)
+        self.assertEqual(collector._daemon_state, DAEMON_RUNNING)
 
     def test_stable_pid_keeps_peer_cache(self):
         collector = Collector(_make_config())
         collector.peers.success([{"addr": "a"}])
         collector._observed_pid = 100
-        collector.check_daemon_restart(100)
+        collector.update_daemon_state(100)
         self.assertEqual(collector.peers.value, [{"addr": "a"}])
 
     def test_first_observation_does_not_invalidate(self):
         collector = Collector(_make_config())
         collector.peers.success([{"addr": "a"}])
-        collector.check_daemon_restart(300)
+        collector.update_daemon_state(300)
         self.assertEqual(collector.peers.value, [{"addr": "a"}])
         self.assertEqual(collector._observed_pid, 300)
+
+    def test_single_miss_does_not_stop_daemon(self):
+        collector = Collector(_make_config())
+        collector.peers.success([{"addr": "a"}])
+        state = collector.update_daemon_state(100)
+        self.assertEqual(state.state, DAEMON_RUNNING)
+        state = collector.update_daemon_state(None)
+        self.assertEqual(state.state, DAEMON_RUNNING)
+        self.assertEqual(collector.peers.value, [{"addr": "a"}])
+
+    def test_second_miss_confirms_stop(self):
+        collector = Collector(_make_config())
+        collector.peers.success([{"addr": "a"}])
+        collector.update_daemon_state(100)
+        collector.update_daemon_state(None)
+        state = collector.update_daemon_state(None)
+        self.assertEqual(state.state, DAEMON_STOPPED)
+        self.assertEqual(state.pid, None)
+        self.assertEqual(collector.peers.value, [{"addr": "a"}])
+        self.assertEqual(collector._observed_pid, None)
+
+    def test_reappearance_after_stop_invalidates_caches(self):
+        collector = Collector(_make_config())
+        collector.peers.success([{"addr": "a"}])
+        collector.update_daemon_state(100)
+        collector.update_daemon_state(None)
+        collector.update_daemon_state(None)
+        collector.peers.success([{"addr": "b"}])
+        state = collector.update_daemon_state(100)
+        self.assertEqual(state.state, DAEMON_RUNNING)
+        self.assertEqual(state.pid, 100)
+        self.assertIsNone(collector.peers.value)
 
 
 class TestCollectorPipeline(unittest.TestCase):

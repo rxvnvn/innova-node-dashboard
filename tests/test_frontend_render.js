@@ -19,11 +19,15 @@ function escStr(s) {
 }
 function makeEl() {
   return {
-    _t: '', _inner: '',
+    _t: '', _inner: '', _children: [],
     get textContent() { return this._t; },
-    set textContent(v) { this._t = String(v); this._inner = escStr(v); },
+    set textContent(v) { this._t = String(v); this._inner = escStr(v); this._children = []; },
     get innerHTML() { return this._inner; },
     set innerHTML(v) { this._inner = String(v); },
+    appendChild(ch) { this._children.push(ch); return ch; },
+    removeChild(ch) { const i = this._children.indexOf(ch); if (i >= 0) this._children.splice(i, 1); return ch; },
+    get firstChild() { return this._children.length ? this._children[0] : null; },
+    setAttribute(k, v) { this[k] = v; },
     className: '',
     hidden: true,
     style: {},
@@ -114,6 +118,71 @@ assert(els.peerState.textContent === ' · cached', `cached marker shown (got ${e
 assert(els.peerAge.hidden === false, 'age indicator visible when stale');
 assert(els.peerAge.textContent.includes('2m 14s old'), `age text present (got ${els.peerAge.textContent})`);
 assert(els.netActive.textContent === '2', 'stale active peers retained');
+
+console.log('case 5: release version link');
+run({
+  node: { online: true }, chain: { height: 1000 },
+  network: {}, ibd: {}, peers: {}, history: [], host: {}, freshness: {},
+  notices: [], errors: [], api: { version: 'v1' }, dashboard: { version: '0.3.3' },
+});
+{
+  const v = els.dashVersion;
+  assert(v._children.length === 1, 'version renders inside a single anchor');
+  const a = v.firstChild;
+  assert(a.href === 'https://github.com/rxvnvn/innova-node-dashboard/releases/tag/v0.3.3', `version href correct (got ${a.href})`);
+  assert(a.textContent === '0.3.3', `version text is 0.3.3 (got ${a.textContent})`);
+  assert(a.target === '_blank', 'target _blank');
+  assert(a.rel === 'noopener noreferrer', 'rel noopener noreferrer');
+}
+
+console.log('case 6: malformed version degrades to plain text, no link');
+run({
+  node: { online: true }, chain: { height: 1000 },
+  network: {}, ibd: {}, peers: {}, history: [], host: {}, freshness: {},
+  notices: [], errors: [], api: {}, dashboard: { version: 'dev-branch' },
+});
+assert(els.dashVersion._children.length === 0, 'no anchor for malformed version');
+assert(els.dashVersion.textContent === 'dev-branch', `malformed version shown as text (got ${els.dashVersion.textContent})`);
+
+console.log('case 7: missing version renders em dash');
+run({
+  node: { online: true }, chain: { height: 1000 },
+  network: {}, ibd: {}, peers: {}, history: [], host: {}, freshness: {},
+  notices: [], errors: [], api: {}, dashboard: {},
+});
+assert(els.dashVersion._children.length === 0, 'no anchor for missing version');
+assert(els.dashVersion.textContent === '—', `missing version renders — (got ${els.dashVersion.textContent})`);
+
+console.log('case 8: confirmed stopped shows Offline and last-known height');
+run({
+  node: { online: false }, chain: { height: null, last_known_height: 6812442, initial_block_download: null },
+  network: {}, ibd: {}, peers: {}, history: [], host: {}, freshness: {},
+  notices: [], errors: [], api: {}, dashboard: { version: '0.3.3' },
+});
+assert(els.badge.className === 'badge offline', `stopped -> offline badge (got ${els.badge.className})`);
+assert(els.status.textContent === 'Offline', `status text Offline (got ${els.status.textContent})`);
+assert(els.height.textContent === '—', 'current height stays unknown while offline');
+assert(els.lastKnownHeight.hidden === false, 'last-known height visible while offline');
+assert(els.lastKnownHeight.textContent.includes('6 812 442'), `last-known height formatted (got ${els.lastKnownHeight.textContent})`);
+
+console.log('case 9: unknown state shows Checking, no last-known');
+run({
+  node: { online: null }, chain: { height: null, last_known_height: null },
+  network: {}, ibd: {}, peers: {}, history: [], host: {}, freshness: {},
+  notices: [], errors: [], api: {}, dashboard: { version: '0.3.3' },
+});
+assert(els.badge.className === 'badge unknown', `unknown -> unknown badge (got ${els.badge.className})`);
+assert(els.status.textContent === 'Checking', `status text Checking (got ${els.status.textContent})`);
+assert(els.lastKnownHeight.hidden === true, 'no last-known height when never observed');
+
+console.log('case 10: online hides last-known height');
+run({
+  node: { online: true }, chain: { height: 6812442, last_known_height: 6812442 },
+  network: {}, ibd: {}, peers: {}, history: [], host: {}, freshness: {},
+  notices: [], errors: [], api: {}, dashboard: { version: '0.3.3' },
+});
+assert(els.lastKnownHeight.hidden === true, 'last-known height hidden while online');
+assert(els.height.textContent === '6 812 442', `live height rendered (got ${els.height.textContent})`);
 
 if (failures) {
   console.error(`\n${failures} frontend assertion(s) failed`);

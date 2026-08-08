@@ -112,6 +112,12 @@ h1 {
   font-size: 11px;
   font-weight: 800;
 }
+.last-known {
+  color: #8290a4;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: right;
+}
 
 /* Grid */
 .grid {
@@ -411,6 +417,11 @@ footer {
   font-size: 12px;
   text-align: center;
 }
+footer a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: #4a5568;
+}
 
 /* Responsive */
 @media (max-width: 620px) {
@@ -421,6 +432,7 @@ footer {
   .heroMeta { text-align: left; }
   .heroMetaRow { justify-content: flex-start; }
   .heroMeta .source { align-self: flex-start; }
+  .last-known { text-align: left; }
   .grid { grid-template-columns: 1fr 1fr; }
   .rate-grid { grid-template-columns: 1fr 1fr; }
   .net-grid { grid-template-columns: 1fr 1fr; }
