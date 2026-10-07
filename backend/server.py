@@ -644,6 +644,25 @@ def parse_bytes(value: Any) -> int | None:
     return None
 
 
+def human_version(value: Any) -> Any:
+    """Human-facing release version.
+
+    The daemon reports a four-component ``CLIENT_VERSION_*`` string (e.g.
+    ``v5.0.3.0``). The fourth component is the internal BUILD number and is not
+    part of the normal release label when it is zero, so ``v5.0.3.0`` is shown
+    as ``v5.0.3``. Only an exactly-four-component string whose last component is
+    ``0`` is shortened: arbitrary trailing components are never removed, and a
+    non-zero build component is preserved verbatim. Non-matching values are
+    returned unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    match = re.match(r"^(v?)(\d+)\.(\d+)\.(\d+)\.(\d+)$", value.strip())
+    if match and match.group(5) == "0":
+        return f"{match.group(1)}{match.group(2)}.{match.group(3)}.{match.group(4)}"
+    return value
+
+
 class TrafficTracker:
     """Ring buffer of cumulative traffic samples used to derive throughput."""
 
@@ -787,7 +806,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
         "node": {
             "online": online,
             "network": "mainnet",
-            "version": info.get("version"),
+            "version": human_version(info.get("version")),
             "build_commit": info.get("buildcommit"),
             "build_dirty": info.get("builddirty"),
             "protocol_version": info.get("protocolversion"),

@@ -28,12 +28,39 @@ from server import (
     build_snapshot,
     compute_eta,
     estimate_network_height,
+    human_version,
     parse_bytes,
 )
 
 
 def _running_daemon() -> DaemonState:
     return DaemonState(state=DAEMON_RUNNING, pid=123)
+
+
+class TestHumanVersion(unittest.TestCase):
+    """The human-facing release label drops a zero CLIENT_VERSION_BUILD only."""
+
+    def test_zero_build_component_is_dropped(self):
+        self.assertEqual(human_version("v5.0.3.0"), "v5.0.3")
+        self.assertEqual(human_version("5.0.3.0"), "5.0.3")
+        self.assertEqual(human_version("v1.2.3.0"), "v1.2.3")
+
+    def test_nonzero_build_component_is_preserved(self):
+        self.assertEqual(human_version("v5.0.3.1"), "v5.0.3.1")
+        self.assertEqual(human_version("5.0.3.4"), "5.0.3.4")
+
+    def test_three_component_versions_unchanged(self):
+        self.assertEqual(human_version("v5.0.3"), "v5.0.3")
+        self.assertEqual(human_version("5.0.1"), "5.0.1")
+
+    def test_arbitrary_trailing_components_not_removed(self):
+        self.assertEqual(human_version("5.0.3.0.0"), "5.0.3.0.0")
+        self.assertEqual(human_version("5.0.3.0-beta"), "5.0.3.0-beta")
+
+    def test_non_string_and_empty_returned_unchanged(self):
+        self.assertIsNone(human_version(None))
+        self.assertEqual(human_version(""), "")
+        self.assertEqual(human_version(5000300), 5000300)
 
 
 class TestParseBytes(unittest.TestCase):
@@ -891,6 +918,23 @@ class TestJSONEndpointPayload(unittest.TestCase):
         self.assertIsNotNone(parsed["network"]["connections"])
         self.assertIsNotNone(parsed["network"]["bytes_received"])
         self.assertIsNotNone(parsed["network"]["bytes_sent"])
+
+
+    @patch("server.process_times", return_value=(None, None))
+    @patch("server.process_pid", return_value=None)
+    def test_node_version_is_human_facing(self, _pid, _times):
+        """The node version exposed by the API drops a zero BUILD component
+        (real getinfo reports v5.0.3.0) but keeps a non-zero one."""
+        config = _make_config()
+        for raw, expected in (("v5.0.3.0", "v5.0.3"), ("v5.0.3.7", "v5.0.3.7"), ("v5.0.3", "v5.0.3")):
+            info = TimedValue()
+            info.success({"blocks": 1000, "connections": 8, "version": raw})
+            peers = TimedValue()
+            peers.success([])
+            blockchain = TimedValue()
+            blockchain.success({"initialblockdownload": True})
+            snap = build_snapshot(config, info, peers, blockchain, IBDTracker(), IBDSampler(), metrics={})
+            self.assertEqual(snap["node"]["version"], expected, f"raw={raw}")
 
 
 if __name__ == "__main__":
