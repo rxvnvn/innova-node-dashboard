@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -165,3 +166,17 @@ class HeightPolicyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ProcessIdentityTest(unittest.TestCase):
+    """The daemon must never be confused with a short-lived RPC child."""
+
+    def test_pid_ignores_rpc_children(self):
+        ps_out = "1100156 1634 innovad\n1101823 9 innovad\n1101831 8 innovad\n"
+        with mock.patch.object(server, "run") as fake_run:
+            fake_run.side_effect = [(0, "", ""), (0, "", ""), (0, ps_out, "")]
+            self.assertEqual(server.process_pid(make_config()), 1100156)
+
+    def test_pid_none_when_no_daemon(self):
+        with mock.patch.object(server, "run") as fake_run:
+            fake_run.side_effect = [(0, "", ""), (0, "", ""), (0, "123 9 python3\n", "")]
+            self.assertIsNone(server.process_pid(make_config()))

@@ -620,17 +620,35 @@ def rpc_json(config: Config, method: str, timeout: int | None = None) -> tuple[A
 
 
 def process_pid(config: Config) -> int | None:
-    commands = (
+    # An RPC call is a short-lived `innovad <method>` child, so pidof/pgrep can
+    # return that child instead of the daemon.  The daemon would then look
+    # "restarted" on the next refresh and every cache would be dropped
+    # (observed: repeated "PID changed" notices and an empty snapshot).  The
+    # daemon is always the longest-lived innovad process.
+    for command in (
         ["systemctl", "show", "innovad.service", "--property=MainPID", "--value"],
-        ["pidof", "-s", "innovad"],
-        ["pgrep", "-xo", "innovad"],
-    )
-    for command in commands:
+        ["systemctl", "show", "innova-live.service", "--property=MainPID", "--value"],
+    ):
         code, output, _ = run(command, config.timeout)
         candidate = output.split()[0] if output else ""
         if code == 0 and candidate.isdigit() and int(candidate) > 0:
             return int(candidate)
-    return None
+
+    code, output, _ = run(["ps", "-eo", "pid=,etimes=,comm="], config.timeout)
+    if code != 0:
+        return None
+    best_pid: int | None = None
+    best_age = -1
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        if Path(parts[2]).name != "innovad":
+            continue
+        age = int(parts[1])
+        if age > best_age:
+            best_pid, best_age = int(parts[0]), age
+    return best_pid
 
 
 def process_times(pid: int | None, config: Config) -> tuple[dt.datetime | None, int | None]:
