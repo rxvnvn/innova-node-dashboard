@@ -423,6 +423,7 @@ class Collector:
         self.log_height = TimedValue()
         self.log_reader = LogHeightReader(initial_scan_bytes=config.log_tail_bytes)
         self._stop = threading.Event()
+        self._started = False
         self._threads: list[threading.Thread] = []
         self.ibd_tracker = IBDTracker()
         self.sampler = IBDSampler()
@@ -513,6 +514,7 @@ class Collector:
             self._stop.wait(1.0)
 
     def start(self) -> None:
+        self._started = True
         for name in list(self.sources):
             thread = threading.Thread(target=self._poll_loop, args=(name,), name=f"rpc-{name}", daemon=True)
             thread.start()
@@ -525,12 +527,12 @@ class Collector:
         with self.lock:
             pid = process_pid(self.config)
             daemon = self.update_daemon_state(pid)
-            # Sources not yet polled by their thread (fresh process / first
-            # request) are fetched once here, each with its own budget. Once a
-            # thread owns them, collect() is a pure cache read and never blocks
-            # on a slow getinfo.
+            # Only an unstarted collector (unit tests, tooling) polls inline.
+            # A served collector is filled by its own threads, so a request
+            # never blocks on a slow RPC: collect() stays a pure cache read
+            # even while getinfo is taking tens of seconds.
             for name, source in self.sources.items():
-                if source.state.last_attempt == 0.0:
+                if not self._started and source.state.last_attempt == 0.0:
                     try:
                         self.poll_source(name)
                     except Exception as exc:
