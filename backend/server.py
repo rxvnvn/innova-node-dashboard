@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.4.0"
 API_VERSION = "v1"
 HEIGHT_RE = re.compile(rb"SetBestChain:.*?\bheight=(\d+)\b")
 
@@ -53,6 +53,9 @@ class Config:
     conf: str | None
     debug_log: Path | None
     frontend: Path
+    # Per-source RPC budgets: a slow getinfo must never gate the fast probes.
+    timeout_fast: int = 6
+    timeout_slow: int = 45
 
 
 @dataclass(frozen=True)
@@ -410,9 +413,17 @@ class Collector:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.lock = threading.Lock()
-        self.info = TimedValue()
-        self.peers = TimedValue()
-        self.blockchain = TimedValue()
+        # Independent metric families: one poller each, one timeout each.
+        self.sources = {
+            "height": RpcSource("height", "getblockcount", config.refresh, config.timeout_fast, _valid_int),
+            "info": RpcSource("info", "getinfo", config.info_interval, config.timeout_slow, lambda v: isinstance(v, dict)),
+            "peers": RpcSource("peers", "getpeerinfo", config.peer_interval, max(config.timeout_fast, 10), lambda v: isinstance(v, list)),
+            "blockchain": RpcSource("blockchain", "getblockchaininfo", config.info_interval, max(config.timeout_fast, 10), lambda v: isinstance(v, dict)),
+        }
+        self.log_height = TimedValue()
+        self.log_reader = LogHeightReader(initial_scan_bytes=config.log_tail_bytes)
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
         self.ibd_tracker = IBDTracker()
         self.sampler = IBDSampler()
         self.traffic = TrafficTracker()
@@ -423,18 +434,29 @@ class Collector:
         self._stop_misses = 0
         self._last_known_height: int | None = None
 
-    def rpc_json(self, method: str) -> tuple[Any | None, str | None]:
-        code, output, error = rpc(self.config, [method])
-        if code != 0:
-            return None, error or output or f"{method} failed"
-        try:
-            return json.loads(output), None
-        except json.JSONDecodeError:
-            return None, f"{method} returned invalid JSON"
+    @property
+    def info(self) -> TimedValue:
+        return self.sources["info"].state
+
+    @property
+    def peers(self) -> TimedValue:
+        return self.sources["peers"].state
+
+    @property
+    def blockchain(self) -> TimedValue:
+        return self.sources["blockchain"].state
+
+    @property
+    def height(self) -> TimedValue:
+        return self.sources["height"].state
+
+    def rpc_json(self, method: str, timeout: int | None = None) -> tuple[Any | None, str | None]:
+        """Single seam for RPC access (patchable; tests use it directly)."""
+        return rpc_json(self.config, method, timeout)
 
     def invalidate_daemon_caches(self, warning: str) -> None:
         """Drop daemon-specific cached state after a restart/stop transition."""
-        for state in (self.info, self.peers, self.blockchain):
+        for state in (self.info, self.peers, self.blockchain, self.height, self.log_height):
             state.invalidate(warning)
         self.traffic.samples.clear()
         self._last_sample_time = 0.0
@@ -466,36 +488,57 @@ class Collector:
         effective_pid = self._observed_pid if self._daemon_state == DAEMON_RUNNING else None
         return DaemonState(state=self._daemon_state, pid=effective_pid)
 
-    def refresh_rpc(self) -> None:
-        if self.info.due(self.config.info_interval, self.config.max_backoff):
-            value, error = self.rpc_json("getinfo")
-            if error is None and isinstance(value, dict):
-                self.info.success(value)
-            else:
-                self.info.failure(f"RPC busy: getinfo unavailable ({error or 'invalid response'})")
+    def _refresh_log_height(self) -> None:
+        value, _updated = self.log_reader.read(self.config.debug_log)
+        if value is None:
+            self.log_height.failure("debug.log: no height line in the incremental window")
+        else:
+            self.log_height.success(value)
 
-        if self.peers.due(self.config.peer_interval, self.config.max_backoff):
-            value, error = self.rpc_json("getpeerinfo")
-            if error is None and isinstance(value, list):
-                self.peers.success([peer for peer in value if isinstance(peer, dict)])
-            else:
-                self.peers.failure(f"RPC busy: getpeerinfo unavailable ({error or 'invalid response'})")
+    def poll_source(self, name: str) -> None:
+        source = self.sources[name]
+        if not source.state.due(source.interval, self.config.max_backoff):
+            return
+        source.poll(self.config, fetcher=self.rpc_json)
+        if name == "height" and as_int(source.state.value) is None:
+            # RPC height unavailable: bounded incremental log fallback only.
+            self._refresh_log_height()
 
-        if self.blockchain.due(self.config.info_interval, self.config.max_backoff):
-            value, error = self.rpc_json("getblockchaininfo")
-            if error is None and isinstance(value, dict):
-                self.blockchain.success(value)
-            else:
-                self.blockchain.failure(f"RPC busy: getblockchaininfo unavailable ({error or 'invalid response'})")
+    def _poll_loop(self, name: str) -> None:
+        while not self._stop.is_set():
+            try:
+                self.poll_source(name)
+            except Exception as exc:  # a poller must never die silently
+                self.sources[name].state.failure(f"poller error: {exc}")
+            self._stop.wait(1.0)
+
+    def start(self) -> None:
+        for name in list(self.sources):
+            thread = threading.Thread(target=self._poll_loop, args=(name,), name=f"rpc-{name}", daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def stop(self) -> None:
+        self._stop.set()
 
     def collect(self) -> dict[str, Any]:
         with self.lock:
             pid = process_pid(self.config)
             daemon = self.update_daemon_state(pid)
-            self.refresh_rpc()
+            # Sources not yet polled by their thread (fresh process / first
+            # request) are fetched once here, each with its own budget. Once a
+            # thread owns them, collect() is a pure cache read and never blocks
+            # on a slow getinfo.
+            for name, source in self.sources.items():
+                if source.state.last_attempt == 0.0:
+                    try:
+                        self.poll_source(name)
+                    except Exception as exc:
+                        source.state.failure(f"poll error: {exc}")
             snapshot = build_snapshot(self.config, self.info, self.peers, self.blockchain,
                                       self.ibd_tracker, self.sampler, self.metrics, self.traffic,
-                                      daemon=daemon, last_known_height=self._last_known_height)
+                                      daemon=daemon, last_known_height=self._last_known_height,
+                                      height_state=self.height, log_state=self.log_height)
             live_height = snapshot.get("chain", {}).get("height")
             if live_height is not None:
                 self._last_known_height = live_height
@@ -554,13 +597,24 @@ def locate_innovad(explicit: str | None) -> str:
     return explicit or "innovad"
 
 
-def rpc(config: Config, args: list[str]) -> tuple[int, str, str]:
+def rpc(config: Config, args: list[str], timeout: int | None = None) -> tuple[int, str, str]:
     command = [config.innovad]
     if config.datadir:
         command.append(f"-datadir={config.datadir}")
     if config.conf:
         command.append(f"-conf={config.conf}")
-    return run(command + args, config.timeout)
+    return run(command + args, config.timeout if timeout is None else timeout)
+
+
+def rpc_json(config: Config, method: str, timeout: int | None = None) -> tuple[Any | None, str | None]:
+    """One RPC call with its own budget. Never raises: returns (value, error)."""
+    code, output, error = rpc(config, [method], timeout)
+    if code != 0:
+        return None, error or output or f"{method} failed"
+    try:
+        return json.loads(output), None
+    except json.JSONDecodeError:
+        return None, f"{method} returned invalid JSON"
 
 
 def process_pid(config: Config) -> int | None:
@@ -595,20 +649,80 @@ def process_times(pid: int | None, config: Config) -> tuple[dt.datetime | None, 
     return started_at, uptime_seconds
 
 
-def read_log_height(path: Path | None, tail_bytes: int) -> tuple[int | None, dt.datetime | None]:
-    if path is None:
-        return None, None
-    try:
-        with path.open("rb") as handle:
-            size = handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, size - tail_bytes), os.SEEK_SET)
-            chunk = handle.read()
-        matches = list(HEIGHT_RE.finditer(chunk))
-        if not matches:
+class RpcSource:
+    """One RPC metric family with its own cadence and its own timeout budget.
+
+    Every source owns a TimedValue, so a slow or failing probe can neither
+    delay nor invalidate any other metric.
+    """
+
+    def __init__(self, name: str, method: str, interval: int, timeout: int, validator) -> None:
+        self.name = name
+        self.method = method
+        self.interval = interval
+        self.timeout = timeout
+        self.validator = validator
+        self.state = TimedValue()
+
+    def poll(self, config: Config, fetcher=None) -> bool:
+        if fetcher is None:
+            value, error = rpc_json(config, self.method, self.timeout)
+        else:
+            value, error = fetcher(self.method)
+        if error is None and self.validator(value):
+            self.state.success(value)
+            return True
+        self.state.failure(f"RPC busy: {self.method} unavailable ({error or 'invalid response'})")
+        return False
+
+
+class LogHeightReader:
+    """Incremental, bounded fallback reader for debug.log height.
+
+    The first read scans at most ``initial_scan_bytes`` backwards. Every later
+    read consumes only the bytes appended since the previous read, capped by
+    ``max_bytes_per_pass``; the file is never re-parsed in full, so a
+    multi-hundred-megabyte log cannot stall the refresh loop. A rotation or
+    truncation (new inode, smaller size) re-seeds the window.
+    """
+
+    def __init__(self, initial_scan_bytes: int = 8 * 1024 * 1024,
+                 max_bytes_per_pass: int = 1024 * 1024) -> None:
+        self.initial_scan_bytes = max(4096, initial_scan_bytes)
+        self.max_bytes_per_pass = max(4096, max_bytes_per_pass)
+        self._key: tuple[int, int] | None = None
+        self._offset = 0
+
+    def read(self, path: Path | None) -> tuple[int | None, dt.datetime | None]:
+        if path is None:
             return None, None
-        return int(matches[-1].group(1)), dt.datetime.fromtimestamp(path.stat().st_mtime).astimezone()
-    except (OSError, ValueError):
-        return None, None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None, None
+        key = (stat.st_dev, stat.st_ino)
+        if key != self._key or stat.st_size < self._offset:
+            self._key = key
+            self._offset = max(0, stat.st_size - self.initial_scan_bytes)
+        try:
+            with path.open("rb") as handle:
+                handle.seek(self._offset)
+                chunk = handle.read(self.max_bytes_per_pass)
+                self._offset = handle.tell()
+        except OSError:
+            return None, None
+        matches = list(HEIGHT_RE.finditer(chunk))
+        height = int(matches[-1].group(1)) if matches else None
+        return height, dt.datetime.fromtimestamp(stat.st_mtime).astimezone()
+
+
+def read_log_height(path: Path | None, tail_bytes: int) -> tuple[int | None, dt.datetime | None]:
+    """Stateless bounded scan (compatibility helper for tests and one-shot use)."""
+    return LogHeightReader(initial_scan_bytes=max(4096, tail_bytes)).read(path)
+
+
+def _valid_int(value: Any) -> bool:
+    return isinstance(value, bool) is False and as_int(value) is not None
 
 
 def as_int(value: Any) -> int | None:
@@ -700,7 +814,9 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
                    sampler: IBDSampler, metrics: dict[str, Any],
                    traffic: TrafficTracker | None = None,
                    daemon: DaemonState | None = None,
-                   last_known_height: int | None = None) -> dict[str, Any]:
+                   last_known_height: int | None = None,
+                   height_state: TimedValue | None = None,
+                   log_state: TimedValue | None = None) -> dict[str, Any]:
     now = dt.datetime.now().astimezone()
     info = info_state.value if isinstance(info_state.value, dict) else {}
     peers = peers_state.value if isinstance(peers_state.value, list) else None
@@ -710,13 +826,38 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     running = daemon.state == DAEMON_RUNNING
     online = True if running else (False if daemon.state == DAEMON_STOPPED else None)
 
-    log_height, log_updated = read_log_height(config.debug_log, config.log_tail_bytes)
-    rpc_height = as_int(info.get("blocks"))
-    height = log_height if log_height is not None else rpc_height
-    height_source = "debug_log" if log_height is not None else ("rpc" if rpc_height is not None else None)
+    # Height policy: RPC is authoritative; the (bounded) log is a fallback;
+    # a cached value is only ever surfaced with its age and a stale marker.
+    rpc_height = as_int(height_state.value) if height_state is not None else None
+    if rpc_height is None:
+        rpc_height = as_int(info.get("blocks"))
+    log_height = as_int(log_state.value) if log_state is not None else None
+    log_age = log_state.age_seconds() if log_state is not None else None
+    height: int | None = None
+    height_source: str | None = None
+    height_ts: dt.datetime | None = None
+    if rpc_height is not None:
+        height = rpc_height
+        height_source = "rpc"
+        height_ts = height_state.updated_wall if height_state is not None else info_state.updated_wall
+    elif log_height is not None and (log_age is None or log_age <= max(60, config.refresh * 6)):
+        height = log_height
+        height_source = "debug_log"
+        height_ts = log_state.updated_wall if log_state is not None else None
+    elif last_known_height is not None:
+        height = last_known_height
+        height_source = "cache"
+        height_ts = None
+    height_age = None
+    if height is not None and height_ts is not None:
+        height_age = max(0, int((now - height_ts).total_seconds()))
+    height_stale = bool(height_source == "cache" or
+                        (height_age is not None and height_age > max(60, config.refresh * 3)))
     if not running:
         height = None
         height_source = None
+        height_age = None
+        height_stale = False
 
     ibd_rpc = blockchain.get("initialblockdownload") if isinstance(blockchain.get("initialblockdownload"), bool) else info.get("initialblockdownload")
 
@@ -730,7 +871,8 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     rpc_ok = info_state.failures == 0 or peers_state.failures == 0
     rpc_failures = max(info_state.failures, peers_state.failures)
 
-    ibd_tracker.update(height)
+    if not height_stale:
+        ibd_tracker.update(height)
     current_rate = sampler.current_rate()
     ibd_tracker.update_ema(current_rate)
 
@@ -816,7 +958,9 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
         "chain": {
             "height": height,
             "height_source": height_source,
-            "height_updated_at": iso(log_updated if height_source == "debug_log" else info_state.updated_wall),
+            "height_updated_at": iso(height_ts),
+            "height_age_seconds": height_age,
+            "height_stale": height_stale,
             "last_known_height": last_known_height,
             "initial_block_download": ibd_rpc,
             "difficulty": info.get("difficulty"),
@@ -824,6 +968,9 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "verification_progress": as_float(blockchain.get("verificationprogress")),
         },
         "network": {
+            # getinfo owns the authoritative connection count; the peer list is
+            # only a fallback when getinfo has no value yet. Both are fetched by
+            # independent pollers, so neither waits on the other.
             "connections": (as_int(info.get("connections")) if info.get("connections") is not None else (len(peers) if isinstance(peers, list) and peers else None)) if running else None,
             "inbound": inbound if running else None,
             "outbound": outbound if running else None,
@@ -960,6 +1107,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=env_int("INNOVA_DASHBOARD_PORT", 8787))
     parser.add_argument("--refresh", type=int, default=env_int("INNOVA_DASHBOARD_REFRESH", 5))
     parser.add_argument("--rpc-timeout", type=int, default=env_int("INNOVA_DASHBOARD_RPC_TIMEOUT", 8))
+    parser.add_argument("--rpc-timeout-fast", type=int,
+                        default=env_int("INNOVA_DASHBOARD_RPC_TIMEOUT_FAST", 6))
+    parser.add_argument("--rpc-timeout-slow", type=int,
+                        default=env_int("INNOVA_DASHBOARD_RPC_TIMEOUT_SLOW",
+                                        env_int("INNOVA_DASHBOARD_RPC_TIMEOUT", 45)))
     parser.add_argument("--info-interval", type=int, default=env_int("INNOVA_DASHBOARD_INFO_INTERVAL", 60))
     parser.add_argument("--peer-interval", type=int, default=env_int("INNOVA_DASHBOARD_PEER_INTERVAL", 120))
     parser.add_argument("--max-backoff", type=int, default=env_int("INNOVA_DASHBOARD_MAX_BACKOFF", 900))
@@ -979,23 +1131,33 @@ def main() -> None:
         max(5, args.info_interval), max(5, args.peer_interval), max(30, args.max_backoff),
         max(4096, args.log_tail_bytes), locate_innovad(args.innovad), datadir, args.conf,
         debug_log, Path(args.frontend_dir).expanduser() if args.frontend_dir else backend.parent / "frontend",
+        timeout_fast=max(2, args.rpc_timeout_fast),
+        timeout_slow=max(args.rpc_timeout_fast, args.rpc_timeout_slow),
     )
 
     server = Server((config.host, config.port), Handler)
     server.config = config
     server.collector = Collector(config)
+    # One bounded fast probe so the first snapshot already has a height, then
+    # every metric refreshes on its own thread.
+    server.collector.poll_source("height")
+    server.collector.start()
     server.snapshot_lock = threading.Lock()
     server.snapshot_data = None
     server.snapshot_updated = 0.0
     print(f"Innova Node Dashboard {APP_VERSION} - http://{config.host}:{config.port}")
     print(f"innovad: {config.innovad}")
     print(f"debug.log: {config.debug_log}")
-    print(f"RPC intervals: getinfo={config.info_interval}s getpeerinfo={config.peer_interval}s")
+    print(f"RPC intervals: height={config.refresh}s getinfo={config.info_interval}s "
+          f"getpeerinfo={config.peer_interval}s")
+    print(f"RPC timeouts: fast={config.timeout_fast}s slow={config.timeout_slow}s "
+          f"log_tail={config.log_tail_bytes}B")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        server.collector.stop()
         server.server_close()
 
 
