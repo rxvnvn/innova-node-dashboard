@@ -50,7 +50,7 @@ The dashboard never infers zero from missing data.
 ```json
 {
   "api": {"name": "innova-node-dashboard", "version": "v1", "schema": 6},
-  "dashboard": {"version": "0.3.3"},
+  "dashboard": { "version": "0.4.0" },
   "generated_at": "2026-07-28T12:00:00+02:00",
   "node": { ... },
   "chain": { ... },

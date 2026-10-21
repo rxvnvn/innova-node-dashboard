@@ -114,6 +114,18 @@ The dashboard is read-only and does not expose arbitrary RPC execution or creden
 
 Serve the same static frontend and implement `GET /api/v1/status` in the daemon according to `docs/API.md`. The frontend contains no Python-specific code.
 
+## Version 0.4.0
+
+Current-height visibility per node:
+
+- **Peer "Current height" column** — the peer table now shows each node's live
+  chain height (`best_known_height`, the peer-reported tip) instead of the static
+  "Start height". Starting height is no longer shown on screen; it is retained in
+  the API payload for internal statistics. Unknown peer heights render `N/A`.
+- **Hero label** — the primary metric is labelled "Current Height" and always
+  comes from the node's canonical chain height (RPC first; when RPC is briefly
+  unavailable the cached last-known value and its source are shown).
+
 ## Version 0.3.3
 
 Daemon lifecycle correctness — the dashboard now distinguishes a live node from

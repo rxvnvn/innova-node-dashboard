@@ -161,13 +161,16 @@ function renderPeerTable(peers, meta) {
   if (!peers || !peers.length) { tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8f9bae">No peers</td></tr>'; return; }
   const sorted = [...peers].sort((a, b) => (b.blocks_inflight || 0) - (a.blocks_inflight || 0));
   tbody.innerHTML = sorted.map(p => {
-    const startH = p.starting_height != null ? integer(p.starting_height) : (p.best_known_height != null ? integer(p.best_known_height) : '—');
+    // Current height of THIS peer's canonical chain. Take the live peer-reported tip
+    // (best_known_height); never fall back to the static start/launch height. When the
+    // peer height is unknown show N/A (staleness is surfaced by the table 'cached' marker).
+    const curH = p.best_known_height != null ? integer(p.best_known_height) : 'N/A';
     const ver = p.version ? esc(String(p.version).replace(/^\/+|\/+$/g, '')) : (p.protocol_version != null ? `v${p.protocol_version}` : '—');
     const pingMs = p.pingtime != null ? p.pingtime * 1000 : null;
     return `<tr>
     <td>${esc(p.addr || '—')}</td>
     <td>${ver}</td>
-    <td>${startH}</td>
+    <td>${curH}</td>
     <td>${p.blocks_inflight || 0}</td>
     <td>${p.ask_queue || 0}</td>
     <td>${bytesHuman(p.bytes_received)}</td>
