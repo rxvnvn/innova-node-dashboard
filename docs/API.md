@@ -49,8 +49,8 @@ The dashboard never infers zero from missing data.
 
 ```json
 {
-  "api": {"name": "innova-node-dashboard", "version": "v1", "schema": 6},
-  "dashboard": { "version": "0.4.0" },
+  "api": {"name": "innova-node-dashboard", "version": "v1", "schema": 7},
+  "dashboard": { "version": "0.4.1" },
   "generated_at": "2026-07-28T12:00:00+02:00",
   "node": { ... },
   "chain": { ... },
@@ -100,10 +100,29 @@ running.
   "height_source": "debug_log",
   "height_updated_at": "2026-07-25T17:00:00+02:00",
   "last_known_height": 6812442,
-  "initial_block_download": true,
+  "initial_block_download": false,
+  "state_updated_at": "2026-07-25T17:00:12+02:00",
+  "state_age_seconds": 4,
+  "state_fresh": true,
+  "state_max_age_seconds": 120,
+  "confirmed_tip": 6484358,
+  "confirmed_tip_support": 9,
+  "peer_announcements": 11,
+  "unconfirmed_peer_tip": 6484425,
+  "behind_confirmed_blocks": 0,
   "verification_progress": 0.9998
 }
 ```
+
+`initial_block_download` is copied from the chain RPC and is **only meaningful
+while `state_fresh` is true**. `state_updated_at`/`state_age_seconds` describe
+the age of that chain-RPC result and `state_max_age_seconds` is the limit
+(`max(120, 2 × info_interval)`); past it the sync verdict degrades instead of
+asserting "synced". `confirmed_tip` is the highest peer-announced height backed
+by a quorum (`confirmed_tip_support` peers within one block), so a single
+outlier announcement appears only in `unconfirmed_peer_tip` and never creates a
+lag verdict. `behind_confirmed_blocks` is `confirmed_tip - height` (0 when not
+behind).
 
 `height` is the live height and is `null` when the daemon is not confirmed
 running. `last_known_height` is the most recent live height observed during this
@@ -193,7 +212,21 @@ peer-derived totals are `null`.
   "session_rate_bpm": 135.7,
   "eta_seconds": 104400,
   "last_height_advance_ago_seconds": 5,
-  "sync_state": "healthy",
+  "sync_state": "synced",
+  "sync_phase": "synced",
+  "sync_reason": "fresh_chain_state_at_confirmed_tip",
+  "sync_basis": {
+    "chain_rpc_age_seconds": 4,
+    "chain_rpc_fresh": true,
+    "chain_rpc_max_age_seconds": 120,
+    "chain_rpc_failures": 0,
+    "peers_age_seconds": 30,
+    "peers_fresh": true,
+    "height_source": "rpc",
+    "height_age_seconds": 0,
+    "height_stale": false,
+    "behind_confirmed_blocks": 0
+  },
   "peer_aggregation": {
     "active_download_peers": 8,
     "total_blocks_inflight": 32,
@@ -219,11 +252,31 @@ peer-derived totals are `null`.
 
 **`eta_seconds`** — estimated time remaining to reach `estimated_tip`, calculated using `rate_ema_bpm`. Null when insufficient data or zero rate.
 
-**`sync_state`**:
-- `healthy` — height advanced < 60 seconds ago
-- `slow` — no advance for 60–180 seconds
-- `stalled` — no advance > 180 seconds during IBD
-- `synced` — IBD complete
+**`sync_phase`** (canonical, schema 7) — one of four states:
+- `synced` — fresh chain RPC says `initialblockdownload=false`, the height is
+  fresh, and the node is at (or within one block of) the confirmed peer tip
+- `syncing` — fresh IBD in progress, or at least two blocks behind the
+  confirmed peer tip
+- `degraded` — the cached chain state is too old to prove anything (the value is
+  still shown, with its age, but the dashboard refuses to claim "complete")
+- `rpc_unavailable` — the chain RPC is failing with no usable value
+- `unknown` — no chain state observed yet, or the daemon is not running
+
+**`sync_reason`** — machine-readable cause: `fresh_chain_state_at_confirmed_tip`,
+`ibd_in_progress`, `behind_confirmed_tip`, `chain_state_stale`,
+`height_unavailable`, `chain_rpc_unavailable`, `no_chain_state`.
+
+**`sync_basis`** — the independent freshness axes behind the verdict: chain RPC
+age/limit/failures, peer snapshot age/freshness, height source/age/staleness and
+`behind_confirmed_blocks`. A live peer panel never upgrades a stale chain
+verdict.
+
+**`sync_state`** (legacy, still emitted for compatibility):
+- `healthy` — IBD in progress, height advanced < 60 seconds ago
+- `slow` — IBD in progress, no advance for 60–180 seconds
+- `stalled` — IBD in progress, no advance > 180 seconds
+- `synced` — fresh IBD complete
+- `degraded` — chain state is stale; "synced" is not asserted
 - `rpc_unavailable` — RPC calls failing
 - `unknown` — cannot determine state
 

@@ -99,8 +99,40 @@ function formatEta(seconds) {
   return [`${(seconds / 86400).toFixed(1)}d`, ''];
 }
 
-const STATE_CLASS = { healthy: 'synced', slow: 'slow', stalled: 'stalled', synced: 'synced', rpc_unavailable: 'stalled', unknown: 'unknown' };
-const STATE_LABEL = { healthy: 'Healthy', slow: 'Slow', stalled: 'Stalled', synced: 'Synced', rpc_unavailable: 'RPC unavailable', unknown: 'Unknown' };
+const STATE_CLASS = { healthy: 'synced', slow: 'slow', stalled: 'stalled', syncing: 'slow', synced: 'synced', degraded: 'stalled', rpc_unavailable: 'stalled', unknown: 'unknown' };
+const STATE_LABEL = { healthy: 'Healthy', slow: 'Slow', stalled: 'Stalled', syncing: 'Syncing', synced: 'Synced', degraded: 'Degraded — stale chain data', rpc_unavailable: 'RPC unavailable', unknown: 'Unknown' };
+
+/* The authoritative four-state sync verdict (0.4.1).
+   `chain.initial_block_download` alone is never enough: a cached false is only
+   trustworthy while `chain.state_fresh` is true. Older payloads without
+   `sync_phase` fall back to the legacy single-value logic so the API stays
+   backward compatible. */
+function syncPhase(c, ibd) {
+  const phase = ibd && ibd.sync_phase;
+  if (phase && STATE_LABEL[phase]) return phase;
+  if (c.state_fresh === false) return 'degraded';
+  if (c.initial_block_download === true) return 'syncing';
+  if (c.initial_block_download === false) return 'synced';
+  return c.height != null ? 'unknown' : 'unknown';
+}
+
+function syncHeadline(c, ibd) {
+  const phase = syncPhase(c, ibd);
+  const behind = c.behind_confirmed_blocks;
+  if (phase === 'synced') return 'Synchronization complete';
+  if (phase === 'syncing') {
+    return behind > 0
+      ? `Syncing — ${integer(behind)} block${behind === 1 ? '' : 's'} behind the confirmed peer tip`
+      : 'IBD — synchronization in progress';
+  }
+  if (phase === 'degraded') {
+    return c.state_age_seconds != null
+      ? `Degraded — chain data ${ageLabel(c.state_age_seconds)} (RPC busy)`
+      : 'Degraded — chain data too old to confirm sync';
+  }
+  if (phase === 'rpc_unavailable') return 'RPC unavailable — sync status unknown';
+  return c.height != null ? 'Node active · sync status unknown' : 'Sync status unknown';
+}
 
 function drawHeightGraph(canvas, history) {
   if (!canvas || !history || history.length < 2) return;
@@ -216,15 +248,18 @@ function render(s) {
   text('api', s.api?.version);
   renderReleaseVersion($('dashVersion'), s.dashboard?.version);
 
-  text('ibd', c.initial_block_download === true ? 'IBD — synchronization in progress' : c.initial_block_download === false ? 'Synchronization complete' : c.height != null ? 'Node active · RPC sync state cached' : 'Sync status unknown');
+  text('ibd', syncHeadline(c, ibd));
   text('updated', relativeAgo(s.generated_at));
-  text('rpcFreshness', `Node info: ${ageLabel(f.getinfo_age_seconds)} · Peers: ${ageLabel(f.getpeerinfo_age_seconds)}`);
+  const chainAge = c.state_age_seconds != null ? c.state_age_seconds : f.getblockchaininfo_age_seconds;
+  const trustedAt = c.state_updated_at ? date(c.state_updated_at) : null;
+  text('rpcFreshness', `Node info: ${ageLabel(f.getinfo_age_seconds)} · Peers: ${ageLabel(f.getpeerinfo_age_seconds)} · Chain: ${ageLabel(chainAge)}${trustedAt ? ` (last trusted update ${trustedAt})` : ''}`);
 
   // IBD section
-  const ibdVisible = ibd.session_type != null && ibd.session_type !== 'synced';
+  const phase = syncPhase(c, ibd);
+  const ibdVisible = (ibd.session_type != null && ibd.session_type !== 'synced') || phase !== 'synced';
   $('ibdSection').hidden = !ibdVisible;
   if (ibdVisible) {
-    const ss = ibd.sync_state || 'unknown';
+    const ss = ibd.sync_phase || ibd.sync_state || 'unknown';
     $('syncState').className = 'sync-state ' + (STATE_CLASS[ss] || 'unknown');
     text('syncState', STATE_LABEL[ss] || 'Unknown');
     if (c.height != null && ibd.estimated_tip != null) {
@@ -245,7 +280,7 @@ function render(s) {
   }
 
   // Rate section
-  const rateVisible = ibd.session_type != null && ibd.session_type !== 'synced';
+  const rateVisible = ibdVisible;
   $('rateSection').hidden = !rateVisible;
   if (rateVisible) {
     text('rateCurrent', formatBpm(ibd.current_rate_bpm));

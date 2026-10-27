@@ -184,6 +184,67 @@ run({
 assert(els.lastKnownHeight.hidden === true, 'last-known height hidden while online');
 assert(els.height.textContent === '6 812 442', `live height rendered (got ${els.height.textContent})`);
 
+console.log('case 11: fresh chain state + IBD=false -> Synchronization complete');
+run({
+  node: { online: true },
+  chain: { height: 1000, initial_block_download: false, state_fresh: true, state_age_seconds: 3,
+           state_updated_at: new Date().toISOString(), behind_confirmed_blocks: 0 },
+  network: {}, ibd: { sync_phase: 'synced', sync_state: 'synced', session_type: 'synced' },
+  peers: {}, history: [], host: {}, freshness: { getblockchaininfo_age_seconds: 3 },
+  notices: [], errors: [], api: {}, dashboard: { version: '0.4.1' },
+});
+assert(els.ibd.textContent === 'Synchronization complete', `synced headline (got ${els.ibd.textContent})`);
+
+console.log('case 12: stale chain state + cached IBD=false -> must NOT say Synchronization complete');
+run({
+  node: { online: true },
+  chain: { height: 1000, initial_block_download: false, state_fresh: false, state_age_seconds: 3298,
+           state_updated_at: new Date(Date.now() - 3298000).toISOString(), behind_confirmed_blocks: 0 },
+  network: {}, ibd: { sync_phase: 'degraded', sync_state: 'degraded', session_type: 'resume_ibd' },
+  peers: { available: true, fresh: true, stale: false, count: 9, items: [] },
+  history: [], host: {}, freshness: { getblockchaininfo_age_seconds: 3298 },
+  notices: [], errors: [], api: {}, dashboard: { version: '0.4.1' },
+});
+assert(!els.ibd.textContent.includes('Synchronization complete'), `no false "complete" on stale chain (got ${els.ibd.textContent})`);
+assert(els.ibd.textContent.includes('Degraded'), `degraded headline (got ${els.ibd.textContent})`);
+assert(!els.ibdSection.hidden, 'sync panel visible when degraded');
+assert(els.syncState.textContent.includes('Degraded'), `chip shows Degraded (got ${els.syncState.textContent})`);
+assert(els.rpcFreshness.textContent.includes('Chain:'), `freshness line shows chain age (got ${els.rpcFreshness.textContent})`);
+assert(els.rpcFreshness.textContent.includes('last trusted update'), 'freshness line shows last trusted update');
+
+console.log('case 13: confirmed lag -> Syncing, with the block count');
+run({
+  node: { online: true },
+  chain: { height: 1000, initial_block_download: false, state_fresh: true, state_age_seconds: 2,
+           behind_confirmed_blocks: 67, confirmed_tip: 1067 },
+  network: {}, ibd: { sync_phase: 'syncing', sync_state: 'synced', session_type: 'resume_ibd',
+                      sync_reason: 'behind_confirmed_tip' },
+  peers: {}, history: [], host: {}, freshness: {},
+  notices: [], errors: [], api: {}, dashboard: { version: '0.4.1' },
+});
+assert(els.ibd.textContent.includes('Syncing'), `syncing headline (got ${els.ibd.textContent})`);
+assert(els.ibd.textContent.includes('67'), `behind count shown (got ${els.ibd.textContent})`);
+assert(els.syncState.textContent === 'Syncing', `chip Syncing (got ${els.syncState.textContent})`);
+
+console.log('case 14: RPC unavailable');
+run({
+  node: { online: true },
+  chain: { height: 1000, initial_block_download: null, state_fresh: false, state_age_seconds: null },
+  network: {}, ibd: { sync_phase: 'rpc_unavailable', sync_state: 'rpc_unavailable' },
+  peers: {}, history: [], host: {}, freshness: { getinfo_failures: 6, getblockchaininfo_failures: 6 },
+  notices: [], errors: [], api: {}, dashboard: { version: '0.4.1' },
+});
+assert(!els.ibd.textContent.includes('Synchronization complete'), 'no complete verdict without RPC');
+assert(els.ibd.textContent.includes('RPC unavailable'), `rpc_unavailable headline (got ${els.ibd.textContent})`);
+
+console.log('case 15: legacy payload without sync_phase still renders (API back-compat)');
+run({
+  node: { online: true }, chain: { height: 1000, initial_block_download: false },
+  network: {}, ibd: { session_type: 'synced' }, peers: {}, history: [], host: {},
+  freshness: {}, notices: [], errors: [], api: {}, dashboard: { version: '0.4.0' },
+});
+assert(els.ibd.textContent === 'Synchronization complete', `legacy synced payload unchanged (got ${els.ibd.textContent})`);
+
 if (failures) {
   console.error(`\n${failures} frontend assertion(s) failed`);
   process.exit(1);

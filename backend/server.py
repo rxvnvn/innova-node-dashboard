@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 API_VERSION = "v1"
 HEIGHT_RE = re.compile(rb"SetBestChain:.*?\bheight=(\d+)\b")
 
@@ -29,6 +29,19 @@ STALE_HEALTHY_S = 60
 STALE_SLOW_S = 180
 EMA_ALPHA = 0.15
 MIN_PEERS_FOR_ETA = 3
+
+# A cached IBD=false is evidence of synchronisation only while the chain RPC that
+# produced it is itself fresh; past this age the dashboard degrades instead of
+# asserting "synced". The effective bound is derived per run from the poll
+# interval (see chain_state_max_age) so a slow poller is not punished.
+CHAIN_STATE_MIN_MAX_AGE_S = 120
+# A peer height becomes "confirmed" only with at least this much support, so a
+# single unconfirmed announcement can never create a lag verdict.
+CONFIRMED_TIP_MIN_SUPPORT = 2
+CONFIRMED_TIP_TOLERANCE = 1
+# A confirmed lag smaller than this is ordinary tip churn on a live chain, not a
+# synchronisation deficit; the raw number is still reported to the UI.
+CONFIRMED_LAG_BLOCKS = 2
 
 STOP_CONFIRM_MISSES = 2
 DAEMON_RUNNING = "running"
@@ -209,6 +222,79 @@ class IBDSampler:
         return out
 
 
+def chain_state_max_age(info_interval: int) -> int:
+    """Oldest chain-RPC state that may still be used as sync evidence."""
+    return max(CHAIN_STATE_MIN_MAX_AGE_S, int(info_interval) * 2)
+
+
+def confirmed_tip_from_peers(peers: list[dict] | None, *,
+                             min_support: int = CONFIRMED_TIP_MIN_SUPPORT,
+                             tolerance: int = CONFIRMED_TIP_TOLERANCE) -> dict[str, Any]:
+    """Highest peer height that a *quorum* of peers actually confirms.
+
+    Peers gossip ``bestknownheight``; a single peer announcing a height far above
+    everybody else is not evidence that this node is behind (it may be stale, on
+    another network, or simply wrong). A height is treated as confirmed only when
+    at least ``min_support`` peers announce it or something higher within
+    ``tolerance`` blocks, so one unconfirmed announcement can never produce a
+    "behind" verdict on its own.
+    """
+    heights: list[int] = []
+    for peer in peers or []:
+        if not isinstance(peer, dict):
+            continue
+        value = as_int(peer.get("bestknownheight"))
+        if value is not None and value > 0:
+            heights.append(value)
+    if not heights:
+        return {"confirmed_tip": None, "support": 0, "max_peer_tip": None, "announcements": 0}
+    required = min(max(int(min_support), 1), len(heights))
+    confirmed: int | None = None
+    support = 0
+    for candidate in sorted(set(heights), reverse=True):
+        backers = sum(1 for h in heights if h >= candidate - tolerance)
+        if backers >= required:
+            confirmed = candidate
+            support = backers
+            break
+    return {
+        "confirmed_tip": confirmed,
+        "support": support,
+        "max_peer_tip": max(heights),
+        "announcements": len(heights),
+    }
+
+
+def resolve_sync_phase(*, ibd_rpc: bool | None, chain_fresh: bool,
+                       chain_failures: int = 0, rpc_failures: int = 0,
+                       height: int | None = None, height_stale: bool = False,
+                       behind_confirmed: int = 0, running: bool = True,
+                       require_height: bool = False,
+                       lag_threshold: int = CONFIRMED_LAG_BLOCKS) -> str:
+    """Canonical four-state sync verdict.
+
+    ``ibd_rpc`` is only ever trusted while the chain RPC that produced it is
+    fresh: a cached ``initialblockdownload=false`` is *not* proof of
+    synchronisation. Freshness of the peer view is deliberately independent —
+    a stale chain verdict may never be presented as "synced" just because the
+    peer panel is live.
+    """
+    failures = chain_failures if chain_failures else rpc_failures
+    if not running:
+        return "unknown"
+    if ibd_rpc is None:
+        return "rpc_unavailable" if failures > 0 else "unknown"
+    if not chain_fresh:
+        return "degraded"
+    if require_height and (height is None or height_stale):
+        return "degraded"
+    if ibd_rpc is True:
+        return "syncing"
+    if behind_confirmed and behind_confirmed >= max(1, int(lag_threshold)):
+        return "syncing"
+    return "synced"
+
+
 class IBDTracker:
     def __init__(self) -> None:
         self.session_start_height: int | None = None
@@ -244,13 +330,34 @@ class IBDTracker:
     def last_advance_time(self) -> float | None:
         return self._last_advance_time
 
-    def sync_state(self, ibd_rpc: bool | None, rpc_failures: int) -> str:
-        if ibd_rpc is None and rpc_failures > 0:
-            return "rpc_unavailable"
-        if ibd_rpc is False:
-            return "synced"
-        if ibd_rpc is not True and rpc_failures == 0 and ibd_rpc is None:
-            return "unknown"
+    def sync_state(self, ibd_rpc: bool | None, rpc_failures: int, *,
+                   chain_age_seconds: int | None = None,
+                   chain_failures: int = 0,
+                   max_chain_age_seconds: int | None = None,
+                   height: int | None = None,
+                   height_stale: bool = False,
+                   behind_confirmed: int = 0,
+                   running: bool = True) -> str:
+        """Legacy sync label, hardened against stale chain state.
+
+        Without freshness inputs the historical contract is preserved (a False
+        IBD is reported as ``synced``): callers that know the age must pass
+        ``chain_age_seconds``/``max_chain_age_seconds``, and then a stale
+        ``IBD=false`` degrades instead of claiming synchronisation. The canonical
+        four-state verdict lives in :func:`resolve_sync_phase`.
+        """
+        chain_fresh = True
+        if chain_age_seconds is not None and max_chain_age_seconds is not None:
+            chain_fresh = chain_age_seconds <= max_chain_age_seconds
+        phase = resolve_sync_phase(
+            ibd_rpc=ibd_rpc, chain_fresh=chain_fresh, chain_failures=chain_failures,
+            rpc_failures=rpc_failures, height=height, height_stale=height_stale,
+            behind_confirmed=behind_confirmed, running=running,
+            require_height=height is not None or height_stale,
+        )
+        if phase != "syncing":
+            return phase
+        # IBD is (freshly) in progress: keep the historical activity detail.
         now = time.time()
         elapsed = now - self.last_height_change if self.last_height_change else 999999
         if elapsed < STALE_HEALTHY_S:
@@ -881,6 +988,21 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
 
     ibd_rpc = blockchain.get("initialblockdownload") if isinstance(blockchain.get("initialblockdownload"), bool) else info.get("initialblockdownload")
 
+    # Independent freshness axes: the chain verdict may only be as trustworthy as
+    # the chain RPC that produced it, and the peer view is a *separate* source.
+    chain_age_seconds = blockchain_state.age_seconds()
+    chain_max_age = chain_state_max_age(config.info_interval)
+    chain_fresh = chain_age_seconds is not None and chain_age_seconds <= chain_max_age
+    chain_failures = blockchain_state.failures
+    peers_age_seconds = peers_state.age_seconds()
+    tip_info = confirmed_tip_from_peers(peers) if peers is not None else {
+        "confirmed_tip": None, "support": 0, "max_peer_tip": None, "announcements": 0,
+    }
+    confirmed_tip = tip_info["confirmed_tip"]
+    behind_confirmed = 0
+    if confirmed_tip is not None and height is not None and confirmed_tip > height:
+        behind_confirmed = confirmed_tip - height
+
     pid = daemon.pid if running else None
     started_at, uptime_seconds = process_times(pid, config)
     inbound = sum(1 for peer in peers if peer.get("inbound") is True) if peers is not None else None
@@ -938,7 +1060,28 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
         peer_agg["total_ask_queue"],
     )
 
-    sync_state = ibd_tracker.sync_state(ibd_rpc, rpc_failures)
+    sync_phase = resolve_sync_phase(
+        ibd_rpc=ibd_rpc, chain_fresh=chain_fresh, chain_failures=chain_failures,
+        rpc_failures=rpc_failures, height=height, height_stale=height_stale,
+        behind_confirmed=behind_confirmed, running=running, require_height=True,
+    )
+    sync_state = ibd_tracker.sync_state(
+        ibd_rpc, rpc_failures, chain_age_seconds=chain_age_seconds,
+        chain_failures=chain_failures, max_chain_age_seconds=chain_max_age,
+        height=height, height_stale=height_stale,
+        behind_confirmed=behind_confirmed, running=running,
+    )
+
+    if sync_phase == "synced":
+        sync_reason = "fresh_chain_state_at_confirmed_tip"
+    elif sync_phase == "syncing":
+        sync_reason = "ibd_in_progress" if ibd_rpc is True else "behind_confirmed_tip"
+    elif sync_phase == "degraded":
+        sync_reason = "chain_state_stale" if not chain_fresh else "height_unavailable"
+    elif sync_phase == "rpc_unavailable":
+        sync_reason = "chain_rpc_unavailable"
+    else:
+        sync_reason = "no_chain_state"
 
     session_start = ibd_tracker.session_start_height
     session_type = "unknown"
@@ -947,7 +1090,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             session_type = "cold_ibd"
         else:
             session_type = "resume_ibd"
-    if sync_state == "synced":
+    if sync_phase == "synced":
         session_type = "synced"
 
     session_rate = sampler.session_average(session_start) if session_start is not None else None
@@ -960,9 +1103,16 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
         last_advance_ago = max(0, int(time.time() - last_advance))
 
     notices = [notice for notice in (info_state.warning, peers_state.warning, blockchain_state.warning) if notice]
+    if running and sync_phase == "degraded":
+        age_label = f"{chain_age_seconds}s" if chain_age_seconds is not None else "unknown"
+        notices.append(f"Chain state is {age_label} old (limit {chain_max_age}s); sync status is not asserted")
+    elif running and sync_phase == "rpc_unavailable" and not blockchain_state.warning:
+        notices.append("RPC unavailable: chain state unknown")
+    if running and behind_confirmed >= CONFIRMED_LAG_BLOCKS:
+        notices.append(f"Behind the confirmed peer tip by {behind_confirmed} blocks")
 
     return {
-        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 6},
+        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 7},
         "dashboard": {"version": APP_VERSION},
         "generated_at": now.isoformat(),
         "node": {
@@ -983,6 +1133,17 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "height_stale": height_stale,
             "last_known_height": last_known_height,
             "initial_block_download": ibd_rpc,
+            # Age of the chain-RPC state this verdict rests on: the value above is
+            # only meaningful while ``state_fresh`` is true.
+            "state_updated_at": iso(blockchain_state.updated_wall),
+            "state_age_seconds": chain_age_seconds,
+            "state_fresh": chain_fresh,
+            "state_max_age_seconds": chain_max_age,
+            "confirmed_tip": confirmed_tip,
+            "confirmed_tip_support": tip_info["support"],
+            "peer_announcements": tip_info["announcements"],
+            "unconfirmed_peer_tip": tip_info["max_peer_tip"],
+            "behind_confirmed_blocks": behind_confirmed,
             "difficulty": info.get("difficulty"),
             "money_supply": info.get("moneysupply"),
             "verification_progress": as_float(blockchain.get("verificationprogress")),
@@ -1017,6 +1178,20 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "eta_seconds": round(eta_seconds) if eta_seconds is not None and eta_seconds < 1e9 else None,
             "last_height_advance_ago_seconds": last_advance_ago,
             "sync_state": sync_state,
+            "sync_phase": sync_phase,
+            "sync_reason": sync_reason,
+            "sync_basis": {
+                "chain_rpc_age_seconds": chain_age_seconds,
+                "chain_rpc_fresh": chain_fresh,
+                "chain_rpc_max_age_seconds": chain_max_age,
+                "chain_rpc_failures": chain_failures,
+                "peers_age_seconds": peers_age_seconds,
+                "peers_fresh": peer_snap.get("fresh"),
+                "height_source": height_source,
+                "height_age_seconds": height_age,
+                "height_stale": height_stale,
+                "behind_confirmed_blocks": behind_confirmed,
+            },
             "peer_aggregation": {
                 "active_download_peers": peer_agg["active_download_peers"],
                 "total_blocks_inflight": peer_agg["total_blocks_inflight"],

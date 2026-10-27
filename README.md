@@ -114,6 +114,33 @@ The dashboard is read-only and does not expose arbitrary RPC execution or creden
 
 Serve the same static frontend and implement `GET /api/v1/status` in the daemon according to `docs/API.md`. The frontend contains no Python-specific code.
 
+## Version 0.4.1
+
+Truthful sync state — the dashboard no longer reports "Synchronization complete"
+on the strength of a stale RPC value:
+
+- **Cached `IBD=false` is not proof** — `initialblockdownload=false` is accepted
+  only while the chain RPC that produced it is fresh (`chain.state_fresh`,
+  limit `max(120, 2 × info_interval)`). Past that age the status degrades
+  instead of claiming synchronisation.
+- **Four explicit states** — `ibd.sync_phase` is one of `synced`, `syncing`,
+  `degraded`, `rpc_unavailable` (plus `unknown` before any chain state exists),
+  with a machine-readable `ibd.sync_reason`.
+- **Lag needs a quorum** — the "behind" verdict uses `chain.confirmed_tip`, the
+  highest peer height announced by at least two peers (within one block). A
+  single peer announcing a height far above everybody else is exposed as
+  `chain.unconfirmed_peer_tip` and can never mark the node as behind on its own.
+- **Independent freshness axes** — the peer panel, the chain RPC and the height
+  probe age separately (`ibd.sync_basis`); a live peer panel never upgrades a
+  stale chain verdict, and the footer now shows the chain age and the last
+  trusted chain update.
+- **Recovery is automatic** — the verdict returns to `synced` on the first fresh
+  poll; no restart or manual action involved.
+- **Compatibility** — the schema is bumped to 7 additively: every pre-existing
+  field is unchanged, `ibd.sync_state` keeps its legacy values and now emits
+  `degraded` where it previously claimed `synced` on stale data.
+- See `CHANGELOG.md` for the release notes and `docs/API.md` for the field docs.
+
 ## Version 0.4.0
 
 Current-height visibility per node:
