@@ -1,3 +1,38 @@
+## 0.4.3 — 2026-10-28
+
+### Fixed — the dashboard no longer triggers a ~0.47 GB read burst every minute
+
+`getinfo` on this chain computes six wallet aggregates (stake weight, balance,
+new mint, stake, unconfirmed, immature). Each one walks the whole wallet and
+resolves every transaction through the block index, which on the authoritative
+V2 path is one `fseek` + `fread` per lookup on `tip-records.dat` /
+`tip-derived.dat` plus block reads from `blkNNNN.dat`.
+
+Measured on 31.77.247.41 (kernel 7.0.0-38, 1 GiB cgroup): one `getinfo` call =
+**~935 MB read over two calls, ~1.4 s each**, attributed with a bounded
+`uprobe`+`vfs_read` probe. Polled every 60 s it evicted the page cache that
+`msghand` needed and made P2P receive/handshake wait on block I/O.
+
+- The dashboard now polls only wallet-free sources: `getblockcount` (height),
+  `getnetworkinfo` (version/protocol/connections), `getnettotals` (traffic),
+  `getblockchaininfo` (blocks/IBD/difficulty/money supply), `getpeerinfo`.
+- `getinfo` is **off by default**. It is kept behind `--build-info-interval`
+  (env `INNOVA_DASHBOARD_BUILD_INFO_INTERVAL`) purely for `buildcommit` /
+  `builddirty`, which no cheap RPC exposes.
+- `chain.difficulty` is now the proof-of-stake difficulty from
+  `getblockchaininfo` (the dashboard has always shown a single number).
+- `freshness` adds `getnetworkinfo_*` / `getnettotals_*` ages and failures plus
+  `getinfo_enabled`.
+- RPC health is computed from the sources that are actually polled, so a
+  disabled `getinfo` can no longer mask a dead RPC.
+- API schema 7 → 8 (additive).
+
+### Tests
+
+166 tests (was 155). New `tests/test_rpc_budget.py` pins the contract: the
+default RPC method set contains no `getinfo`, fields map from the cheap
+sources, and a full `collect()` cycle issues no `getinfo` call.
+
 # Changelog
 
 All notable changes to Innova Node Dashboard. This file records releases from

@@ -319,10 +319,12 @@ class TestCollectorPipeline(unittest.TestCase):
         col = Collector(self._config())
 
         def rpc(method):
-            if method == "getinfo":
-                return {"blocks": 1000, "connections": 2}, None
+            # The dashboard no longer polls getinfo (it walks the whole wallet);
+            # connections/version come from getnetworkinfo.
+            if method == "getnetworkinfo":
+                return {"version": 5000500, "protocolversion": 70016, "connections": 2}, None
             if method == "getblockchaininfo":
-                return {"initialblockdownload": True}, None
+                return {"initialblockdownload": True, "blocks": 1000}, None
             return None, "RPC busy: timed out after 8 seconds"
 
         with patch.object(col, "rpc_json", side_effect=rpc), \
@@ -340,10 +342,12 @@ class TestCollectorPipeline(unittest.TestCase):
         col = Collector(self._config())
 
         def rpc(method):
-            if method == "getinfo":
-                return {"blocks": 1000, "connections": 2}, None
+            # The dashboard no longer polls getinfo (it walks the whole wallet);
+            # connections/version come from getnetworkinfo.
+            if method == "getnetworkinfo":
+                return {"version": 5000500, "protocolversion": 70016, "connections": 2}, None
             if method == "getblockchaininfo":
-                return {"initialblockdownload": True}, None
+                return {"initialblockdownload": True, "blocks": 1000}, None
             return None, "RPC busy: timed out after 8 seconds"
 
         with patch.object(col, "rpc_json", side_effect=rpc), \

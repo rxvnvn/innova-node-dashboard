@@ -49,7 +49,7 @@ The dashboard never infers zero from missing data.
 
 ```json
 {
-  "api": {"name": "innova-node-dashboard", "version": "v1", "schema": 7},
+  "api": {"name": "innova-node-dashboard", "version": "v1", "schema": 8},
   "dashboard": { "version": "0.4.1" },
   "generated_at": "2026-07-28T12:00:00+02:00",
   "node": { ... },
@@ -145,16 +145,16 @@ until a live height has been observed and never affects `node.online`.
     "sent": 83919555,
     "rx_rate_bps": 1243000.0,
     "tx_rate_bps": 182000.0,
-    "source": "getinfo"
+    "source": "getnettotals"
   }
 }
 ```
 
-**Cumulative counters.** `getinfo` returns `datareceived`/`datasent` as human-readable strings (for example `"537.48 MB"`). The backend parses them back to bytes. When `getinfo` totals are unavailable, per-peer byte counters are summed and `source` becomes `"peers"`.
+**Cumulative counters.** `getnettotals` returns `totalbytesrecv`/`totalbytessent` as integers; the backend parses either integers or the human-readable strings `getinfo` used to return. When `getnettotals` totals are unavailable, per-peer byte counters are summed and `source` becomes `"peers"`. `getinfo` (schema < 8) is no longer polled by default: it walks the entire wallet (~0.47 GB of reads per call on a production node).
 
 **Throughput.** `rx_rate_bps`/`tx_rate_bps` are derived from consecutive traffic samples (an average over the last counter update interval, normally one `getinfo` poll). No additional RPC polling is performed; the values are computed from data already being fetched.
 
-**`connections`** comes from `getinfo` and is independent of peer snapshot
+**`connections`** comes from `getnetworkinfo` and is independent of peer snapshot
 availability. `inbound`, `outbound` and `average_ping_ms` are peer-derived:
 they are `null` while no successful `getpeerinfo` result exists, and hold real
 counts (including `0` for a valid empty peer snapshot) once available.
@@ -314,10 +314,15 @@ Stored in memory only. No database. After dashboard restart, a new observed sess
 
 ```json
 {
-  "getinfo_age_seconds": 42,
+  "getinfo_age_seconds": null,
   "getpeerinfo_age_seconds": 93,
   "getblockchaininfo_age_seconds": 42,
   "getinfo_failures": 0,
+  "getnetworkinfo_age_seconds": 41,
+  "getnettotals_age_seconds": 41,
+  "getnetworkinfo_failures": 0,
+  "getnettotals_failures": 0,
+  "getinfo_enabled": false,
   "getpeerinfo_failures": 1,
   "getblockchaininfo_failures": 0
 }
@@ -329,3 +334,24 @@ Returns HTTP 200 only when the daemon is confirmed running
 (`node.online === true`), otherwise HTTP 503. It does not require a successful
 RPC response. A stopped daemon is not healthy; an unobserved (unknown) daemon is
 not yet confirmed healthy.
+
+
+## Schema 8 — wallet-free RPC budget
+
+Schema 8 removes the dashboard's dependency on `getinfo`. `getinfo` computes six
+wallet aggregates (stake weight, balance, new mint, stake, unconfirmed,
+immature); every one of them walks the whole wallet and resolves each
+transaction through the block index, which costs ~0.47 GB of file reads and
+~1.4 s per call on a production node. Polling it every 60 s starved the P2P
+message handler of page cache.
+
+| field | schema 7 source | schema 8 source |
+|---|---|---|
+| `node.version`, `node.protocol_version` | `getinfo` | `getnetworkinfo` |
+| `network.connections` | `getinfo` | `getnetworkinfo` |
+| `network.bytes_received/sent` | `getinfo` | `getnettotals` |
+| `chain.initial_block_download`, `chain.money_supply` | `getinfo` fallback | `getblockchaininfo` |
+| `chain.difficulty` | `getinfo` (number) | `getblockchaininfo.difficulty["proof-of-stake"]` |
+| `node.build_commit`, `node.build_dirty` | `getinfo` | `null` unless `--build-info-interval > 0` |
+
+`freshness.getinfo_enabled` reports whether the slow build-identity poll is on.

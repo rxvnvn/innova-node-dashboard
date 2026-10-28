@@ -266,3 +266,14 @@ The browser still refreshes every five seconds, but this no longer means an RPC 
 - the installer detects the owner and group of `INNOVA_DATADIR`;
 - the systemd service runs as that owner, avoiding private datadir permission errors;
 - the public dashboard UI is now in English.
+
+## 0.4.3
+
+`getinfo` is no longer polled. On this chain it walks the entire wallet (six
+aggregates), which on a production node costs ~0.47 GB of file reads and ~1.4 s
+per call; polling it every minute starved the P2P message handler of page cache.
+The dashboard now uses `getnetworkinfo`, `getnettotals`, `getblockchaininfo` and
+`getblockcount`, all of which are wallet-free. Build identity (`buildcommit` /
+`builddirty`) is available only when `--build-info-interval` is set to a
+non-zero value; it is 0 (off) by default.
+

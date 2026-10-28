@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 API_VERSION = "v1"
 HEIGHT_RE = re.compile(rb"SetBestChain:.*?\bheight=(\d+)\b")
 
@@ -69,6 +69,13 @@ class Config:
     # Per-source RPC budgets: a slow getinfo must never gate the fast probes.
     timeout_fast: int = 6
     timeout_slow: int = 45
+    # ``getinfo`` is NOT polled by default: on this chain it computes six wallet
+    # aggregates (stake weight, balance, mint, stake, unconfirmed, immature) and
+    # every one of them walks the whole wallet, resolving each tx through the
+    # block index. Measured on a production node: ~0.47 GB of file reads and
+    # ~1.4 s per call. 0 disables it; a positive value is a *slow* poll used only
+    # for build identity (buildcommit/builddirty).
+    build_info_interval: int = 0
 
 
 @dataclass(frozen=True)
@@ -523,10 +530,17 @@ class Collector:
         # Independent metric families: one poller each, one timeout each.
         self.sources = {
             "height": RpcSource("height", "getblockcount", config.refresh, config.timeout_fast, _valid_int),
-            "info": RpcSource("info", "getinfo", config.info_interval, config.timeout_slow, lambda v: isinstance(v, dict)),
+            # Cheap substitutes for the fields the dashboard actually needs from
+            # getinfo: version/protocol/connections (getnetworkinfo) and
+            # session traffic counters (getnettotals). Neither touches the wallet.
+            "netinfo": RpcSource("netinfo", "getnetworkinfo", config.info_interval, config.timeout_slow, lambda v: isinstance(v, dict)),
+            "nettotals": RpcSource("nettotals", "getnettotals", config.info_interval, config.timeout_fast, lambda v: isinstance(v, dict)),
             "peers": RpcSource("peers", "getpeerinfo", config.peer_interval, max(config.timeout_fast, 10), lambda v: isinstance(v, list)),
             "blockchain": RpcSource("blockchain", "getblockchaininfo", config.info_interval, max(config.timeout_fast, 10), lambda v: isinstance(v, dict)),
         }
+        if config.build_info_interval > 0:
+            self.sources["info"] = RpcSource("info", "getinfo", config.build_info_interval,
+                                             config.timeout_slow, lambda v: isinstance(v, dict))
         self.log_height = TimedValue()
         self.log_reader = LogHeightReader(initial_scan_bytes=config.log_tail_bytes)
         self._stop = threading.Event()
@@ -544,7 +558,17 @@ class Collector:
 
     @property
     def info(self) -> TimedValue:
-        return self.sources["info"].state
+        # Optional, slow, build-identity-only source. Never polled by default.
+        source = self.sources.get("info")
+        return source.state if source is not None else TimedValue()
+
+    @property
+    def netinfo(self) -> TimedValue:
+        return self.sources["netinfo"].state
+
+    @property
+    def nettotals(self) -> TimedValue:
+        return self.sources["nettotals"].state
 
     @property
     def peers(self) -> TimedValue:
@@ -647,7 +671,8 @@ class Collector:
             snapshot = build_snapshot(self.config, self.info, self.peers, self.blockchain,
                                       self.ibd_tracker, self.sampler, self.metrics, self.traffic,
                                       daemon=daemon, last_known_height=self._last_known_height,
-                                      height_state=self.height, log_state=self.log_height)
+                                      height_state=self.height, log_state=self.log_height,
+                                      netinfo_state=self.netinfo, nettotals_state=self.nettotals)
             live_height = snapshot.get("chain", {}).get("height")
             if live_height is not None:
                 self._last_known_height = live_height
@@ -885,6 +910,20 @@ def parse_bytes(value: Any) -> int | None:
     return None
 
 
+def client_version_string(value: Any) -> Any:
+    """Normalise CLIENT_VERSION to the ``v5.0.5.0`` form ``human_version`` reads.
+
+    ``getnetworkinfo`` reports the packed integer (e.g. 5000500) while ``getinfo``
+    reports the formatted string; the dashboard must render both identically.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "v%d.%d.%d.%d" % (value // 1000000, (value // 10000) % 100,
+                                 (value // 100) % 100, value % 100)
+    return value
+
+
 def human_version(value: Any) -> Any:
     """Human-facing release version.
 
@@ -943,11 +982,51 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
                    daemon: DaemonState | None = None,
                    last_known_height: int | None = None,
                    height_state: TimedValue | None = None,
-                   log_state: TimedValue | None = None) -> dict[str, Any]:
+                   log_state: TimedValue | None = None,
+                   netinfo_state: TimedValue | None = None,
+                   nettotals_state: TimedValue | None = None) -> dict[str, Any]:
     now = dt.datetime.now().astimezone()
-    info = info_state.value if isinstance(info_state.value, dict) else {}
     peers = peers_state.value if isinstance(peers_state.value, list) else None
     blockchain = blockchain_state.value if isinstance(blockchain_state.value, dict) else {}
+    netinfo = netinfo_state.value if (netinfo_state is not None and isinstance(netinfo_state.value, dict)) else {}
+    nettotals = nettotals_state.value if (nettotals_state is not None and isinstance(nettotals_state.value, dict)) else {}
+    # ``info`` used to be the single source for version, connections, traffic,
+    # difficulty and money supply. It is now composed from cheap sources so the
+    # dashboard never has to call getinfo (which walks the wallet): build
+    # identity is the only field that still needs it, and only when enabled.
+    buildinfo = info_state.value if isinstance(info_state.value, dict) else {}
+    info: dict[str, Any] = {}
+    if isinstance(blockchain.get("blocks"), int):
+        info["blocks"] = blockchain.get("blocks")
+    if isinstance(blockchain.get("initialblockdownload"), bool):
+        info["initialblockdownload"] = blockchain.get("initialblockdownload")
+    if isinstance(blockchain.get("moneysupply"), (int, float)):
+        info["moneysupply"] = blockchain.get("moneysupply")
+    chain_diff = blockchain.get("difficulty")
+    if isinstance(chain_diff, dict):
+        # getblockchaininfo splits the difficulty; the dashboard has always shown
+        # a single number, which on this proof-of-stake chain is the PoS value.
+        info["difficulty"] = chain_diff.get("proof-of-stake")
+    elif chain_diff is not None:
+        info["difficulty"] = chain_diff
+    if netinfo.get("version") is not None:
+        info["version"] = client_version_string(netinfo.get("version"))
+    if netinfo.get("protocolversion") is not None:
+        info["protocolversion"] = netinfo.get("protocolversion")
+    if netinfo.get("connections") is not None:
+        info["connections"] = netinfo.get("connections")
+    if nettotals.get("totalbytesrecv") is not None:
+        info["datareceived"] = nettotals.get("totalbytesrecv")
+    if nettotals.get("totalbytessent") is not None:
+        info["datasent"] = nettotals.get("totalbytessent")
+    # Anything the cheap sources could not answer falls back to a getinfo reply
+    # if one exists (it does only when build_info_interval > 0).
+    for key in ("blocks", "initialblockdownload", "difficulty", "moneysupply", "version",
+                "protocolversion", "connections", "datareceived", "datasent"):
+        if info.get(key) is None and buildinfo.get(key) is not None:
+            info[key] = buildinfo[key]
+    info["buildcommit"] = buildinfo.get("buildcommit")
+    info["builddirty"] = buildinfo.get("builddirty")
 
     daemon = daemon or DaemonState()
     running = daemon.state == DAEMON_RUNNING
@@ -1010,8 +1089,15 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
     pings = [as_float(peer.get("pingtime")) for peer in peers] if peers is not None else None
     pings = [ping for ping in pings if ping is not None] if pings else None
 
-    rpc_ok = info_state.failures == 0 or peers_state.failures == 0
-    rpc_failures = max(info_state.failures, peers_state.failures)
+    # RPC health must reflect the sources that are actually polled: with getinfo
+    # disabled its failure counter stays 0 forever and would mask a dead RPC.
+    health_states = [peers_state, blockchain_state, height_state]
+    if netinfo_state is not None:
+        health_states.append(netinfo_state)
+    if nettotals_state is not None:
+        health_states.append(nettotals_state)
+    rpc_ok = any(state.failures == 0 for state in health_states if state is not None)
+    rpc_failures = max([state.failures for state in health_states if state is not None] or [0])
 
     if not height_stale:
         ibd_tracker.update(height)
@@ -1034,7 +1120,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
 
     traffic_received = parse_bytes(info.get("datareceived"))
     traffic_sent = parse_bytes(info.get("datasent"))
-    traffic_source = "getinfo"
+    traffic_source = "getnettotals" if (netinfo_state is not None and nettotals) else "getinfo"
     if traffic_received is None and peers:
         traffic_received = sum(p["bytes_received"] or 0 for p in (peer_agg["details"] or []))
         traffic_source = "peers"
@@ -1112,7 +1198,7 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
         notices.append(f"Behind the confirmed peer tip by {behind_confirmed} blocks")
 
     return {
-        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 7},
+        "api": {"name": "innova-node-dashboard", "version": API_VERSION, "schema": 8},
         "dashboard": {"version": APP_VERSION},
         "generated_at": now.isoformat(),
         "node": {
@@ -1209,6 +1295,13 @@ def build_snapshot(config: Config, info_state: TimedValue, peers_state: TimedVal
             "getinfo_failures": info_state.failures,
             "getpeerinfo_failures": peers_state.failures,
             "getblockchaininfo_failures": blockchain_state.failures,
+            # getinfo is off by default (it walks the whole wallet); these two
+            # cheap sources replace it and carry the freshness that matters.
+            "getnetworkinfo_age_seconds": netinfo_state.age_seconds() if netinfo_state is not None else None,
+            "getnettotals_age_seconds": nettotals_state.age_seconds() if nettotals_state is not None else None,
+            "getnetworkinfo_failures": netinfo_state.failures if netinfo_state is not None else None,
+            "getnettotals_failures": nettotals_state.failures if nettotals_state is not None else None,
+            "getinfo_enabled": bool(config.build_info_interval > 0),
         },
         "features": {
             "peers": peers is not None,
@@ -1308,6 +1401,9 @@ def main() -> None:
                         default=env_int("INNOVA_DASHBOARD_RPC_TIMEOUT_SLOW",
                                         env_int("INNOVA_DASHBOARD_RPC_TIMEOUT", 45)))
     parser.add_argument("--info-interval", type=int, default=env_int("INNOVA_DASHBOARD_INFO_INTERVAL", 60))
+    parser.add_argument("--build-info-interval", type=int,
+                        default=env_int("INNOVA_DASHBOARD_BUILD_INFO_INTERVAL", 0),
+                        help="seconds between getinfo polls for build identity (0 = never; getinfo walks the whole wallet)")
     parser.add_argument("--peer-interval", type=int, default=env_int("INNOVA_DASHBOARD_PEER_INTERVAL", 120))
     parser.add_argument("--max-backoff", type=int, default=env_int("INNOVA_DASHBOARD_MAX_BACKOFF", 900))
     parser.add_argument("--log-tail-bytes", type=int, default=env_int("INNOVA_DASHBOARD_LOG_TAIL_BYTES", 262144))
@@ -1328,6 +1424,7 @@ def main() -> None:
         debug_log, Path(args.frontend_dir).expanduser() if args.frontend_dir else backend.parent / "frontend",
         timeout_fast=max(2, args.rpc_timeout_fast),
         timeout_slow=max(args.rpc_timeout_fast, args.rpc_timeout_slow),
+        build_info_interval=max(0, args.build_info_interval),
     )
 
     server = Server((config.host, config.port), Handler)
@@ -1343,7 +1440,9 @@ def main() -> None:
     print(f"Innova Node Dashboard {APP_VERSION} - http://{config.host}:{config.port}")
     print(f"innovad: {config.innovad}")
     print(f"debug.log: {config.debug_log}")
-    print(f"RPC intervals: height={config.refresh}s getinfo={config.info_interval}s "
+    build_note = (f"getinfo={config.build_info_interval}s (build identity only)"
+                  if config.build_info_interval > 0 else "getinfo=off (walks the wallet)")
+    print(f"RPC intervals: height={config.refresh}s netinfo/nettotals={config.info_interval}s {build_note} "
           f"getpeerinfo={config.peer_interval}s")
     print(f"RPC timeouts: fast={config.timeout_fast}s slow={config.timeout_slow}s "
           f"log_tail={config.log_tail_bytes}B")

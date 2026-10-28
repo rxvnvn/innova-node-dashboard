@@ -718,10 +718,10 @@ class TestBuildSnapshotNoCrash(unittest.TestCase):
         col = Collector(config)
 
         def rpc(method):
-            if method == "getinfo":
-                return {"blocks": 500, "connections": 2}, None
+            if method == "getnetworkinfo":
+                return {"version": 5000500, "protocolversion": 70016, "connections": 2}, None
             if method == "getblockchaininfo":
-                return {"initialblockdownload": False}, None
+                return {"initialblockdownload": False, "blocks": 500}, None
             return None, "RPC busy"
 
         with patch.object(col, "rpc_json", side_effect=rpc), \
