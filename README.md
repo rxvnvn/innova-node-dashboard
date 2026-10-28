@@ -114,6 +114,17 @@ The dashboard is read-only and does not expose arbitrary RPC execution or creden
 
 Serve the same static frontend and implement `GET /api/v1/status` in the daemon according to `docs/API.md`. The frontend contains no Python-specific code.
 
+## Version 0.4.2
+
+Release-structure release — the deploy/rollback tooling is now inside a tagged
+release instead of trailing `v0.4.1`:
+
+- `scripts/deploy-dashboard-0.4.1.sh` and `scripts/rollback-dashboard.sh` ship
+  with the tag (backup → stage → restart only the dashboard service → smoke →
+  automatic rollback).
+- No runtime change: the backend differs from 0.4.1 only in `APP_VERSION`.
+- `v0.4.1` is unchanged; nothing was rewritten or force-pushed.
+
 ## Version 0.4.1
 
 Truthful sync state — the dashboard no longer reports "Synchronization complete"

@@ -255,7 +255,7 @@ class TestSnapshotScenarios(unittest.TestCase):
             self.assertIn(key, snap)
         self.assertEqual(snap["api"]["version"], "v1")
         self.assertEqual(snap["api"]["schema"], 7)
-        self.assertEqual(snap["dashboard"]["version"], "0.4.1")
+        self.assertEqual(snap["dashboard"]["version"], "0.4.2")
         for key in ("height", "height_source", "initial_block_download",
                     "verification_progress"):
             self.assertIn(key, snap["chain"])

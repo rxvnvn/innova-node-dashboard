@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 API_VERSION = "v1"
 HEIGHT_RE = re.compile(rb"SetBestChain:.*?\bheight=(\d+)\b")
 

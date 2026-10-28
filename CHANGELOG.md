@@ -4,6 +4,20 @@ All notable changes to Innova Node Dashboard. This file records releases from
 0.4.1 onwards; earlier release notes are the `## Version …` sections of
 `README.md`.
 
+## [0.4.2] - 2026-10-28
+
+### Changed
+- **Release structure only** — the deploy/rollback tooling that landed in
+  `8015194` (after the `v0.4.1` tag) is now part of a tagged release, so
+  `v0.4.2` is a single ref that contains both the sync-state fix and the scripts
+  used to ship it. No runtime behaviour change: `backend/server.py` differs from
+  0.4.1 only in `APP_VERSION`.
+
+### Notes
+- `v0.4.1` is left untouched (no history rewrite, no force push).
+- Deploying 0.4.2 is optional: the running 0.4.1 service already serves the
+  fixed logic; the only functional artefact this release adds is tooling.
+
 ## [0.4.1] - 2026-10-28
 
 ### Fixed
